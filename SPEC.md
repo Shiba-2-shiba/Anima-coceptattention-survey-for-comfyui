@@ -25,6 +25,7 @@ MVPでは、モデル内部を大きく改造せず、ComfyUIの `MODEL` に `op
 - CFG branch別の観測
 - JSONL/CSV向けの機械可読ログ
 - 64x64 heatmap生成に使えるattention map統計
+- prompt token単位と、指定phrase/concept単位のheatmap出力
 
 非対象:
 
@@ -114,6 +115,7 @@ Inputs:
 - `mode`: `observe`, `off`
 - `capture_level`: `summary`, `tokens`, `heatmap`
 - `prompt_text`: prompt used to build token index labels
+- `concept_terms`: optional phrases, one per line or comma-separated, used to create combined phrase heatmaps
 - `target_call_indices`: `all`, comma list, range
 - `diagnostic_call_indices`: `all`, comma list, range
 - `branch_mode`: `both`, `positive_only`, `negative_only`
@@ -134,6 +136,10 @@ Behavior:
 - `mode=off`: 元のmodelを返す
 - `mode=observe`: original attention backendを呼び、観測だけ行う
 - `prompt_text` が指定された場合、`clip.tokenize()` から `token_index -> token_id/token_text/token_source` を復元する
+- `concept_terms` が指定された場合、`prompt_text` のtoken列からphraseに対応する連続tokenを探し、複数tokenのattentionを合算したconcept heatmapを出力する
+- `jsonl_path` と `heatmap_dir` の相対パスはComfyUIの `output` ディレクトリ基準で解決する
+- デフォルトJSONLは `anima_concept_survey/logs/survey.jsonl`
+- デフォルトheatmap出力先は `anima_concept_survey/heatmaps`
 - 既存の `optimized_attention_override` がある場合はエラーにする
 - fallback reasonを必ず記録する
 - 観測ができないattention callはoriginal backendへ戻す
@@ -193,9 +199,27 @@ Each eligible observation should include:
       "score_entropy": 0.75
     }
   ],
+  "concept_scores": [
+    {
+      "term": "big breasts",
+      "token_indices": [0, 1],
+      "token_texts": ["big", " breasts"],
+      "token_sources": ["qwen3_06b", "qwen3_06b"],
+      "score_mean": 0.01,
+      "score_max": 0.08,
+      "score_entropy": 0.75
+    }
+  ],
   "estimated_logits_mib": 64.0
 }
 ```
+
+Notes:
+
+- `token_scores` are the top individual prompt tokens for a given observed attention call.
+- `concept_scores` are emitted only when `concept_terms` can be matched to tokenized `prompt_text`.
+- Phrase matching normalizes spaces and punctuation for matching, but records the actual matched `token_texts`.
+- Heatmaps are latent-grid attention summaries, not final-image segmentation masks.
 
 ### Report Outputs
 
@@ -207,8 +231,11 @@ Expected files:
 - `survey_by_step.csv`
 - `survey_by_branch.csv`
 - `recommended_lora_targets.csv`
-- optional heatmap PNG files
-- optional heatmap NPY files
+- optional token heatmap PNG/NPY files
+- optional token aggregate heatmaps under `heatmaps/aggregate`
+- optional concept heatmaps under `heatmaps/concepts`
+- optional concept aggregate heatmaps under `heatmaps/concepts/aggregate`
+- heatmap `manifest.json` files mapping token/concept metadata to image files
 
 ## Metrics
 
@@ -222,6 +249,8 @@ Initial metrics:
 - per-call token score trajectory
 - positive/negative CFG branch difference
 - late-step emphasis score
+- concept/phrase score by summed token attention
+- aggregate token/concept heatmaps across observed calls
 
 Later metrics:
 
@@ -254,6 +283,8 @@ Later metrics:
 - Aggregate image-query to text-key attention into 64x64 maps
 - Export PNG/NPY per token/concept
 - Add configurable layer/step aggregation
+- Export 512px color previews for visual inspection
+- Write manifests that link token/concept metadata to heatmap files
 
 ### Phase 4: Concept Prompt Survey
 
@@ -261,6 +292,13 @@ Later metrics:
 - Encode concept prompts through existing CLIP/T5 path if feasible
 - Compare concept embeddings against observed text/image vectors
 - Keep this separate from MVP until base observation is stable
+
+Current MVP concept behavior:
+
+- `concept_terms` does not encode a separate concept stream.
+- It matches phrases against the already-tokenized `prompt_text`.
+- It sums attention over the matched token indices and writes phrase-level heatmaps.
+- It is intended for cases such as `big breasts`, where a human-facing phrase spans multiple tokenizer tokens.
 
 ## Verification Strategy
 
@@ -273,6 +311,9 @@ Unit tests:
 - JSONL serialization
 - report aggregation
 - fallback handling
+- ComfyUI output path resolution
+- concept phrase token matching
+- concept phrase heatmap export
 
 Smoke tests:
 
@@ -287,6 +328,8 @@ Manual ComfyUI validation:
 - observe run with node
 - confirm same output image when observe mode only calls original backend
 - confirm JSONL contains eligible calls and summaries
+- confirm heatmap aggregate output is readable
+- confirm `concept_terms` output appears under `heatmaps/concepts/aggregate`
 
 ## Risks
 
@@ -295,6 +338,8 @@ Manual ComfyUI validation:
 - Full logits can be large; MVP must keep VRAM guards and top-k/sampled summaries.
 - Existing `optimized_attention_override` patches cannot compose safely yet.
 - ComfyUI internals may expose block metadata inconsistently; logs must tolerate `unknown`.
+- Individual token aggregate heatmaps can include undecoded internal/special tokens; concept heatmaps should be used for phrase-level inspection.
+- Concept phrase matching depends on `prompt_text` matching the actual conditioning text passed to the model.
 
 ## Naming Note
 

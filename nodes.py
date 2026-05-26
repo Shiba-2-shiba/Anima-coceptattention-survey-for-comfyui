@@ -9,11 +9,15 @@ from comfy_api.latest import ComfyExtension, io
 from .anima_concept_survey import (
     BRANCH_MODES,
     CAPTURE_LEVELS,
+    DEFAULT_HEATMAP_RELATIVE_DIR,
+    DEFAULT_JSONL_RELATIVE_PATH,
     FAIL_MODES,
     MODES,
     AnimaConceptSurveyAttentionOverride,
     SurveyConfig,
     is_anima_like_model,
+    resolve_comfy_jsonl_path,
+    resolve_comfy_output_path,
 )
 
 
@@ -36,14 +40,25 @@ class AnimaConceptSurveyModelPatch(io.ComfyNode):
                 io.Combo.Input("mode", options=MODES, default="observe"),
                 io.Combo.Input("capture_level", options=CAPTURE_LEVELS, default="tokens"),
                 io.String.Input("prompt_text", multiline=True, default="", tooltip="Prompt text used to restore token text labels with the connected CLIP."),
+                io.String.Input("concept_terms", multiline=True, default="", tooltip="Optional phrases to export as combined phrase heatmaps, one per line. Example: big breasts"),
                 io.String.Input("target_call_indices", default="all", advanced=True),
                 io.String.Input("diagnostic_call_indices", default="all", advanced=True),
                 io.Combo.Input("branch_mode", options=BRANCH_MODES, default="both", advanced=True),
                 io.Int.Input("max_tokens", default=16, min=1, max=512, step=1, advanced=True),
                 io.Int.Input("max_steps", default=0, min=0, max=10000, step=1, advanced=True),
-                io.String.Input("jsonl_path", default="", advanced=True),
+                io.String.Input(
+                    "jsonl_path",
+                    default=DEFAULT_JSONL_RELATIVE_PATH,
+                    advanced=True,
+                    tooltip="Absolute .jsonl file, or relative .jsonl file under ComfyUI output directory. Empty disables JSONL output.",
+                ),
                 io.Boolean.Input("save_heatmaps", default=False, advanced=True),
-                io.String.Input("heatmap_dir", default="", advanced=True),
+                io.String.Input(
+                    "heatmap_dir",
+                    default=DEFAULT_HEATMAP_RELATIVE_DIR,
+                    advanced=True,
+                    tooltip="Absolute directory, or relative directory under ComfyUI output directory.",
+                ),
                 io.Float.Input("max_logits_mib", default=1024.0, min=1.0, max=65536.0, step=16.0, advanced=True),
                 io.Combo.Input("fail_mode", options=FAIL_MODES, default="fallback", advanced=True),
             ],
@@ -60,6 +75,7 @@ class AnimaConceptSurveyModelPatch(io.ComfyNode):
         mode,
         capture_level,
         prompt_text,
+        concept_terms,
         target_call_indices,
         diagnostic_call_indices,
         branch_mode,
@@ -84,12 +100,16 @@ class AnimaConceptSurveyModelPatch(io.ComfyNode):
             branch_mode=branch_mode,
             max_tokens=max_tokens,
             max_steps=max_steps,
-            jsonl_path=jsonl_path.strip() or None,
+            jsonl_path=resolve_comfy_jsonl_path(jsonl_path),
             save_heatmaps=save_heatmaps,
-            heatmap_dir=heatmap_dir.strip() or None,
+            heatmap_dir=resolve_comfy_output_path(
+                heatmap_dir,
+                default_relative=DEFAULT_HEATMAP_RELATIVE_DIR if save_heatmaps else None,
+            ),
             max_logits_mib=max_logits_mib,
             fail_mode=fail_mode,
             prompt_text=prompt_text,
+            concept_terms=concept_terms,
         )
         config.validate()
 

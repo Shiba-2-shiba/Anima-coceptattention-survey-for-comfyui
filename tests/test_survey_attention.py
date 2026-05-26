@@ -8,9 +8,12 @@ import torch
 from anima_concept_survey.survey_attention import (
     AnimaConceptSurveyAttentionOverride,
     SurveyConfig,
+    build_concept_token_groups,
     infer_square_spatial_shape,
     parse_call_index_scope,
     progress_from_sigmas,
+    resolve_comfy_jsonl_path,
+    resolve_comfy_output_path,
     selected_branch_indices,
 )
 
@@ -67,6 +70,38 @@ class SurveyAttentionTests(unittest.TestCase):
     def test_infer_square_spatial_shape(self):
         self.assertEqual(infer_square_spatial_shape(64), (8, 8))
         self.assertIsNone(infer_square_spatial_shape(65))
+
+    def test_resolve_comfy_output_path_keeps_absolute_and_bases_relative(self):
+        base = Path(tempfile.gettempdir()) / "survey-base"
+        absolute = base / "abs" / "survey.jsonl"
+        self.assertEqual(resolve_comfy_output_path(str(absolute), base_dir=base), str(absolute))
+        self.assertEqual(
+            resolve_comfy_output_path("'reports/survey.jsonl'", base_dir=base),
+            str(base / "reports" / "survey.jsonl"),
+        )
+        self.assertEqual(
+            resolve_comfy_output_path("", default_relative="anima/heatmaps", base_dir=base),
+            str(base / "anima" / "heatmaps"),
+        )
+        self.assertIsNone(resolve_comfy_output_path("", base_dir=base))
+        self.assertEqual(
+            resolve_comfy_jsonl_path("logs", base_dir=base),
+            str(base / "logs" / "survey.jsonl"),
+        )
+        self.assertEqual(
+            resolve_comfy_jsonl_path("logs/custom.jsonl", base_dir=base),
+            str(base / "logs" / "custom.jsonl"),
+        )
+        self.assertIsNone(resolve_comfy_jsonl_path("", base_dir=base))
+
+    def test_build_concept_token_groups_matches_phrase_tokens(self):
+        groups = build_concept_token_groups("big breasts", {
+            0: {"token_text": "big", "token_source": "qwen"},
+            1: {"token_text": " breasts", "token_source": "qwen"},
+            2: {"token_text": ",", "token_source": "qwen"},
+        })
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].token_indices, (0, 1))
 
     def test_progress_last_model_step_reaches_one(self):
         info = progress_from_sigmas({
@@ -172,6 +207,51 @@ class SurveyAttentionTests(unittest.TestCase):
             )
             self.assertGreaterEqual(len(list(heatmap_dir.glob("*.npy"))), 2)
             self.assertGreaterEqual(len(list(heatmap_dir.glob("*.png"))), 2)
+            self.assertTrue((heatmap_dir / "manifest.json").exists())
+            self.assertGreaterEqual(len(list((heatmap_dir / "aggregate").glob("*_preview.png"))), 2)
+            self.assertTrue((heatmap_dir / "aggregate" / "manifest.json").exists())
+
+    def test_concept_terms_export_combined_phrase_heatmaps(self):
+        torch.manual_seed(41)
+        q = torch.randn(1, 2, 16, 4)
+        k = torch.randn(1, 2, 5, 4)
+        v = torch.randn(1, 2, 5, 4)
+        with tempfile.TemporaryDirectory() as tmp:
+            jsonl_path = Path(tmp) / "survey.jsonl"
+            heatmap_dir = Path(tmp) / "heatmaps"
+            override = AnimaConceptSurveyAttentionOverride(SurveyConfig(
+                jsonl_path=str(jsonl_path),
+                capture_level="heatmap",
+                save_heatmaps=True,
+                heatmap_dir=str(heatmap_dir),
+                max_tokens=1,
+                concept_terms="big breasts",
+                token_text_map={
+                    0: {"token_index": 0, "token_text": "big", "token_source": "qwen"},
+                    1: {"token_index": 1, "token_text": " breasts", "token_source": "qwen"},
+                    2: {"token_index": 2, "token_text": ",", "token_source": "qwen"},
+                },
+            ))
+            override(
+                reference_attention,
+                q,
+                k,
+                v,
+                2,
+                skip_reshape=True,
+                transformer_options={
+                    "sigmas": torch.tensor([0.5]),
+                    "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
+                },
+            )
+            override.finalize()
+            records = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+            observation = next(record for record in records if record.get("event") == "attention_observation")
+            self.assertEqual(observation["concept_scores"][0]["term"], "big breasts")
+            self.assertEqual(observation["concept_scores"][0]["token_indices"], [0, 1])
+            self.assertTrue((heatmap_dir / "concepts" / "manifest.json").exists())
+            self.assertTrue((heatmap_dir / "concepts" / "aggregate" / "manifest.json").exists())
+            self.assertGreaterEqual(len(list((heatmap_dir / "concepts" / "aggregate").glob("*big_breasts_preview.png"))), 1)
 
 
 if __name__ == "__main__":

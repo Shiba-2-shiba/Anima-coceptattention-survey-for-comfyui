@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 import json
 import logging
 import math
+import os
+import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,6 +22,9 @@ MODES = ["observe", "off"]
 CAPTURE_LEVELS = ["summary", "tokens", "heatmap"]
 BRANCH_MODES = ["both", "positive_only", "negative_only"]
 FAIL_MODES = ["fallback", "raise"]
+DEFAULT_OUTPUT_SUBDIR = "anima_concept_survey"
+DEFAULT_JSONL_RELATIVE_PATH = f"{DEFAULT_OUTPUT_SUBDIR}/logs/survey.jsonl"
+DEFAULT_HEATMAP_RELATIVE_DIR = f"{DEFAULT_OUTPUT_SUBDIR}/heatmaps"
 
 
 @dataclass(frozen=True)
@@ -37,6 +42,7 @@ class SurveyConfig:
     max_logits_mib: float = 1024.0
     fail_mode: str = "fallback"
     prompt_text: str = ""
+    concept_terms: str = ""
     token_text_map: dict[int, dict[str, Any]] = field(default_factory=dict)
 
     def validate(self) -> None:
@@ -99,6 +105,38 @@ class SurveyStats:
         return step
 
 
+@dataclass
+class HeatmapAccumulator:
+    token_index: int
+    branch: str
+    heatmap_sum: torch.Tensor
+    count: int = 0
+    score_sum: float = 0.0
+    score_max: float = 0.0
+    token_meta: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ConceptTokenGroup:
+    term: str
+    token_indices: tuple[int, ...]
+    token_texts: tuple[str, ...]
+    token_sources: tuple[str, ...]
+
+
+@dataclass
+class ConceptHeatmapAccumulator:
+    term: str
+    branch: str
+    token_indices: tuple[int, ...]
+    token_texts: tuple[str, ...]
+    token_sources: tuple[str, ...]
+    heatmap_sum: torch.Tensor
+    count: int = 0
+    score_sum: float = 0.0
+    score_max: float = 0.0
+
+
 class SurveyFallback(RuntimeError):
     def __init__(self, reason: str):
         super().__init__(reason)
@@ -140,6 +178,62 @@ def parse_call_index_scope(spec: str) -> set[int] | None:
                 raise ValueError("call index scope entries must be non-negative")
             indices.add(index)
     return indices
+
+
+def comfy_output_dir() -> Path:
+    try:
+        import folder_paths  # type: ignore
+    except Exception:
+        return Path.cwd()
+
+    get_output_directory = getattr(folder_paths, "get_output_directory", None)
+    if callable(get_output_directory):
+        try:
+            return Path(get_output_directory())
+        except Exception:
+            return Path.cwd()
+    output_directory = getattr(folder_paths, "output_directory", None)
+    if output_directory:
+        return Path(output_directory)
+    return Path.cwd()
+
+
+def resolve_comfy_output_path(
+    value: str | None,
+    *,
+    default_relative: str | None = None,
+    base_dir: str | Path | None = None,
+) -> str | None:
+    text = "" if value is None else str(value).strip().strip("\"'")
+    if not text:
+        if default_relative is None:
+            return None
+        text = default_relative
+
+    expanded = os.path.expandvars(os.path.expanduser(text))
+    path = Path(expanded)
+    if not path.is_absolute():
+        base = Path(base_dir) if base_dir is not None else comfy_output_dir()
+        path = base / path
+    return str(path)
+
+
+def resolve_comfy_jsonl_path(
+    value: str | None,
+    *,
+    default_relative: str | None = DEFAULT_JSONL_RELATIVE_PATH,
+    base_dir: str | Path | None = None,
+) -> str | None:
+    if value is not None and not str(value).strip():
+        return None
+    path_text = resolve_comfy_output_path(value, default_relative=default_relative, base_dir=base_dir)
+    if path_text is None:
+        return None
+    path = Path(path_text)
+    original = "" if value is None else str(value).strip().strip("\"'")
+    if original.endswith(("/", "\\")) or path.exists() and path.is_dir() or path.suffix.lower() != ".jsonl":
+        path = path / "survey.jsonl"
+    return str(path)
 
 
 def infer_square_spatial_shape(query_len: int) -> tuple[int, int] | None:
@@ -304,6 +398,118 @@ def _heatmap_for_token(attention_probs: torch.Tensor, token_index: int, spatial:
     return heatmap.reshape(spatial)
 
 
+def _safe_filename_text(value: str, max_len: int = 40) -> str:
+    if not value:
+        return ""
+    value = re.sub(r"\s+", "_", value.strip())
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "", value)
+    return value[:max_len].strip("._-")
+
+
+def parse_concept_terms(spec: str) -> list[str]:
+    terms: list[str] = []
+    for line in str(spec or "").replace(";", "\n").splitlines():
+        for part in line.split(","):
+            term = part.strip()
+            if term:
+                terms.append(term)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        normalized = _normalize_concept_text(term)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            deduped.append(term)
+    return deduped
+
+
+def build_concept_token_groups(concept_terms: str, token_text_map: dict[int, dict[str, Any]]) -> list[ConceptTokenGroup]:
+    terms = parse_concept_terms(concept_terms)
+    if not terms or not token_text_map:
+        return []
+
+    by_source: dict[str, list[tuple[int, str]]] = {}
+    for index in sorted(token_text_map):
+        meta = token_text_map[index]
+        token_text = str(meta.get("token_text") or "")
+        if not token_text:
+            continue
+        source = str(meta.get("token_source") or "")
+        by_source.setdefault(source, []).append((index, token_text))
+
+    groups: list[ConceptTokenGroup] = []
+    for term in terms:
+        term_key = _normalize_concept_text(term)
+        if not term_key:
+            continue
+        for source, tokens in by_source.items():
+            match = _find_token_text_sequence(term_key, tokens)
+            if match is None:
+                continue
+            indices, texts = match
+            groups.append(ConceptTokenGroup(
+                term=term,
+                token_indices=tuple(indices),
+                token_texts=tuple(texts),
+                token_sources=tuple(source for _ in indices),
+            ))
+            break
+    return groups
+
+
+def _find_token_text_sequence(term_key: str, tokens: list[tuple[int, str]]) -> tuple[list[int], list[str]] | None:
+    for start in range(len(tokens)):
+        indices: list[int] = []
+        texts: list[str] = []
+        combined = ""
+        for index, token_text in tokens[start:]:
+            piece = _normalize_concept_text(token_text)
+            if not piece:
+                continue
+            combined += piece
+            indices.append(index)
+            texts.append(token_text)
+            if combined == term_key:
+                return indices, texts
+            if len(combined) >= len(term_key) and not term_key.startswith(combined):
+                break
+            if not term_key.startswith(combined):
+                break
+    return None
+
+
+def _normalize_concept_text(value: str) -> str:
+    value = value.replace("▁", " ").replace("Ġ", " ")
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _colorize_heatmap(arr: Any) -> Any:
+    import numpy as np
+
+    x = np.asarray(arr, dtype=np.float32).clip(0.0, 1.0)
+    stops = np.array([
+        [0.0, 0.0, 0.0],
+        [0.0, 0.12, 0.45],
+        [0.0, 0.75, 0.85],
+        [1.0, 0.85, 0.0],
+        [1.0, 0.12, 0.0],
+    ], dtype=np.float32)
+    scaled = x * (len(stops) - 1)
+    lower = np.floor(scaled).astype(np.int32).clip(0, len(stops) - 1)
+    upper = np.ceil(scaled).astype(np.int32).clip(0, len(stops) - 1)
+    frac = (scaled - lower)[..., None]
+    rgb = stops[lower] * (1.0 - frac) + stops[upper] * frac
+    return (rgb * 255.0).clip(0, 255).astype(np.uint8)
+
+
+def _public_concept_record(concept: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in concept.items()
+        if not key.startswith("_")
+    }
+
+
 class AnimaConceptSurveyAttentionOverride:
     def __init__(self, config: SurveyConfig, clip: Any | None = None):
         config.validate()
@@ -315,8 +521,14 @@ class AnimaConceptSurveyAttentionOverride:
         self.token_text_map = dict(config.token_text_map)
         if not self.token_text_map and config.prompt_text:
             self.token_text_map = build_token_text_map(clip, config.prompt_text)
+        self._heatmap_accumulators: dict[tuple[str, int], HeatmapAccumulator] = {}
+        self.concept_token_groups = build_concept_token_groups(config.concept_terms, self.token_text_map)
+        self._concept_heatmap_accumulators: dict[tuple[str, str], ConceptHeatmapAccumulator] = {}
 
     def finalize(self) -> None:
+        if self.config.capture_level == "heatmap" and self.config.save_heatmaps:
+            self._save_aggregate_heatmaps()
+            self._save_aggregate_concept_heatmaps()
         self._emit_jsonl(self._run_summary_record())
 
     def __call__(self, original_func: Callable, *args: Any, **kwargs: Any) -> torch.Tensor:
@@ -457,6 +669,9 @@ class AnimaConceptSurveyAttentionOverride:
                             "token_source": token_meta.get("token_source"),
                             "token_weight": token_meta.get("weight"),
                         })
+            concept_scores = []
+            if self.config.capture_level == "heatmap" and self.concept_token_groups:
+                concept_scores = self._concept_scores_from_attention(branch_probs, spatial)
             record = {
                 "schema_version": 1,
                 "event": "attention_observation",
@@ -483,10 +698,12 @@ class AnimaConceptSurveyAttentionOverride:
                 "estimated_logits_mib": estimated_logits_mib,
                 "prompt_text": self.config.prompt_text,
                 "token_scores": token_scores,
+                "concept_scores": [_public_concept_record(concept) for concept in concept_scores],
             }
             self._emit_jsonl(record)
             if self.config.capture_level == "heatmap" and self.config.save_heatmaps:
-                self._save_heatmaps(branch_probs, token_scores, spatial, progress, eligible_call_index, branch)
+                self._save_heatmaps(branch_probs, token_scores, spatial, progress, eligible_call_index, branch, record)
+                self._save_concept_heatmaps(concept_scores, spatial, progress, eligible_call_index, branch)
 
     def _save_heatmaps(
         self,
@@ -496,19 +713,219 @@ class AnimaConceptSurveyAttentionOverride:
         progress: ProgressInfo,
         eligible_call_index: int,
         branch: str,
+        record: dict[str, Any],
     ) -> None:
         import numpy as np
 
         out_dir = Path(self.config.heatmap_dir or "")
         out_dir.mkdir(parents=True, exist_ok=True)
+        manifest_rows = []
         for token in token_scores:
             token_index = int(token["token_index"])
-            heatmap = _heatmap_for_token(attention_probs, token_index, spatial).detach().cpu().to(torch.float32).numpy()
-            stem = f"step{progress.index:03d}_call{eligible_call_index:03d}_{branch}_token{token_index:03d}"
+            heatmap_tensor = _heatmap_for_token(attention_probs, token_index, spatial).detach().cpu().to(torch.float32)
+            heatmap = heatmap_tensor.numpy()
+            token_label = _safe_filename_text(str(token.get("token_text") or ""))
+            suffix = f"_{token_label}" if token_label else ""
+            stem = f"step{progress.index:03d}_call{eligible_call_index:03d}_{branch}_token{token_index:03d}{suffix}"
             np.save(out_dir / f"{stem}.npy", heatmap)
             self._save_heatmap_png(out_dir / f"{stem}.png", heatmap)
+            self._save_heatmap_png(out_dir / f"{stem}_preview.png", heatmap, size=(512, 512), color=True)
+            self._update_heatmap_accumulator(branch, token, heatmap_tensor)
+            manifest_rows.append({
+                "png": f"{stem}.png",
+                "preview_png": f"{stem}_preview.png",
+                "npy": f"{stem}.npy",
+                "step_index": progress.index,
+                "num_steps": progress.num_steps,
+                "eligible_call_index": eligible_call_index,
+                "branch": branch,
+                "block": record.get("block"),
+                "spatial": list(spatial),
+                "token": token,
+            })
+        self._write_heatmap_manifest(out_dir, manifest_rows)
+        self._save_aggregate_heatmaps()
 
-    def _save_heatmap_png(self, path: Path, heatmap: Any) -> None:
+    def _concept_scores_from_attention(self, attention_probs: torch.Tensor, spatial: tuple[int, int]) -> list[dict[str, Any]]:
+        rows = []
+        text_len = int(attention_probs.shape[-1])
+        for group in self.concept_token_groups:
+            indices = [index for index in group.token_indices if 0 <= index < text_len]
+            if not indices:
+                continue
+            index_tensor = torch.tensor(indices, dtype=torch.long, device=attention_probs.device)
+            concept_attention = attention_probs.index_select(-1, index_tensor).sum(dim=-1)
+            heatmap = concept_attention.mean(dim=(0, 1)).reshape(spatial)
+            entropy = _normalized_entropy(heatmap.flatten(), dim=0)
+            rows.append({
+                "term": group.term,
+                "token_indices": indices,
+                "token_texts": list(group.token_texts),
+                "token_sources": list(group.token_sources),
+                "score_mean": float(concept_attention.mean().detach().cpu().item()),
+                "score_max": float(concept_attention.amax().detach().cpu().item()),
+                "score_entropy": float(entropy.detach().cpu().item()),
+                "_heatmap": heatmap.detach().cpu().to(torch.float32),
+            })
+        return rows
+
+    def _save_concept_heatmaps(
+        self,
+        concept_scores: list[dict[str, Any]],
+        spatial: tuple[int, int],
+        progress: ProgressInfo,
+        eligible_call_index: int,
+        branch: str,
+    ) -> None:
+        import numpy as np
+
+        if not concept_scores:
+            return
+        out_dir = Path(self.config.heatmap_dir or "") / "concepts"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest_rows = []
+        for concept in concept_scores:
+            heatmap_tensor = concept["_heatmap"]
+            heatmap = heatmap_tensor.numpy()
+            term_label = _safe_filename_text(str(concept["term"])) or "concept"
+            stem = f"step{progress.index:03d}_call{eligible_call_index:03d}_{branch}_concept_{term_label}"
+            np.save(out_dir / f"{stem}.npy", heatmap)
+            self._save_heatmap_png(out_dir / f"{stem}.png", heatmap)
+            self._save_heatmap_png(out_dir / f"{stem}_preview.png", heatmap, size=(512, 512), color=True)
+            self._update_concept_heatmap_accumulator(branch, concept, heatmap_tensor)
+            manifest_rows.append({
+                "png": f"{stem}.png",
+                "preview_png": f"{stem}_preview.png",
+                "npy": f"{stem}.npy",
+                "step_index": progress.index,
+                "num_steps": progress.num_steps,
+                "eligible_call_index": eligible_call_index,
+                "branch": branch,
+                "spatial": list(spatial),
+                **_public_concept_record(concept),
+            })
+        self._write_heatmap_manifest(out_dir, manifest_rows)
+        self._save_aggregate_concept_heatmaps()
+
+    def _update_heatmap_accumulator(self, branch: str, token: dict[str, Any], heatmap: torch.Tensor) -> None:
+        key = (branch, int(token["token_index"]))
+        acc = self._heatmap_accumulators.get(key)
+        if acc is None:
+            acc = HeatmapAccumulator(
+                token_index=int(token["token_index"]),
+                branch=branch,
+                heatmap_sum=torch.zeros_like(heatmap, dtype=torch.float32),
+                token_meta={
+                    key: token.get(key)
+                    for key in ("token_id", "token_text", "token_source", "token_weight")
+                    if token.get(key) is not None
+                },
+            )
+            self._heatmap_accumulators[key] = acc
+        acc.heatmap_sum += heatmap.to(torch.float32)
+        acc.count += 1
+        score_mean = token.get("score_mean")
+        if score_mean is not None:
+            acc.score_sum += float(score_mean)
+        score_max = token.get("score_max")
+        if score_max is not None:
+            acc.score_max = max(acc.score_max, float(score_max))
+
+    def _update_concept_heatmap_accumulator(self, branch: str, concept: dict[str, Any], heatmap: torch.Tensor) -> None:
+        key = (branch, str(concept["term"]))
+        acc = self._concept_heatmap_accumulators.get(key)
+        if acc is None:
+            acc = ConceptHeatmapAccumulator(
+                term=str(concept["term"]),
+                branch=branch,
+                token_indices=tuple(int(index) for index in concept["token_indices"]),
+                token_texts=tuple(str(text) for text in concept["token_texts"]),
+                token_sources=tuple(str(source) for source in concept["token_sources"]),
+                heatmap_sum=torch.zeros_like(heatmap, dtype=torch.float32),
+            )
+            self._concept_heatmap_accumulators[key] = acc
+        acc.heatmap_sum += heatmap.to(torch.float32)
+        acc.count += 1
+        acc.score_sum += float(concept.get("score_mean") or 0.0)
+        acc.score_max = max(acc.score_max, float(concept.get("score_max") or 0.0))
+
+    def _save_aggregate_heatmaps(self) -> None:
+        import numpy as np
+
+        if not self._heatmap_accumulators:
+            return
+        out_dir = Path(self.config.heatmap_dir or "") / "aggregate"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest = []
+        for acc in sorted(self._heatmap_accumulators.values(), key=lambda item: (item.branch, item.token_index)):
+            if acc.count <= 0:
+                continue
+            heatmap = (acc.heatmap_sum / acc.count).numpy()
+            token_label = _safe_filename_text(str(acc.token_meta.get("token_text") or ""))
+            suffix = f"_{token_label}" if token_label else ""
+            stem = f"aggregate_{acc.branch}_token{acc.token_index:03d}{suffix}"
+            np.save(out_dir / f"{stem}.npy", heatmap)
+            self._save_heatmap_png(out_dir / f"{stem}.png", heatmap)
+            self._save_heatmap_png(out_dir / f"{stem}_preview.png", heatmap, size=(512, 512), color=True)
+            manifest.append({
+                "png": f"{stem}.png",
+                "preview_png": f"{stem}_preview.png",
+                "npy": f"{stem}.npy",
+                "branch": acc.branch,
+                "token_index": acc.token_index,
+                "observation_count": acc.count,
+                "score_mean": acc.score_sum / acc.count if acc.count else None,
+                "score_max": acc.score_max,
+                **acc.token_meta,
+            })
+        (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _save_aggregate_concept_heatmaps(self) -> None:
+        import numpy as np
+
+        if not self._concept_heatmap_accumulators:
+            return
+        out_dir = Path(self.config.heatmap_dir or "") / "concepts" / "aggregate"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest = []
+        for acc in sorted(self._concept_heatmap_accumulators.values(), key=lambda item: (item.branch, item.term)):
+            if acc.count <= 0:
+                continue
+            heatmap = (acc.heatmap_sum / acc.count).numpy()
+            term_label = _safe_filename_text(acc.term) or "concept"
+            stem = f"aggregate_{acc.branch}_concept_{term_label}"
+            np.save(out_dir / f"{stem}.npy", heatmap)
+            self._save_heatmap_png(out_dir / f"{stem}.png", heatmap)
+            self._save_heatmap_png(out_dir / f"{stem}_preview.png", heatmap, size=(512, 512), color=True)
+            manifest.append({
+                "png": f"{stem}.png",
+                "preview_png": f"{stem}_preview.png",
+                "npy": f"{stem}.npy",
+                "branch": acc.branch,
+                "term": acc.term,
+                "token_indices": list(acc.token_indices),
+                "token_texts": list(acc.token_texts),
+                "token_sources": list(acc.token_sources),
+                "observation_count": acc.count,
+                "score_mean": acc.score_sum / acc.count if acc.count else None,
+                "score_max": acc.score_max,
+            })
+        (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _write_heatmap_manifest(self, out_dir: Path, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        path = out_dir / "manifest.json"
+        existing = []
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = []
+        existing.extend(rows)
+        path.write_text(json.dumps(existing, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _save_heatmap_png(self, path: Path, heatmap: Any, *, size: tuple[int, int] | None = None, color: bool = False) -> None:
         try:
             from PIL import Image
             import numpy as np
@@ -522,7 +939,14 @@ class AnimaConceptSurveyAttentionOverride:
             arr = (arr - min_value) / (max_value - min_value)
         else:
             arr = np.zeros_like(arr)
-        Image.fromarray((arr * 255.0).clip(0, 255).astype(np.uint8), mode="L").save(path)
+        if color:
+            image = Image.fromarray(_colorize_heatmap(arr), mode="RGB")
+        else:
+            image = Image.fromarray((arr * 255.0).clip(0, 255).astype(np.uint8), mode="L")
+        if size is not None:
+            resample = getattr(getattr(Image, "Resampling", Image), "BILINEAR")
+            image = image.resize(size, resample)
+        image.save(path)
 
     def _scope_contains(self, scope: set[int] | None, eligible_call_index: int) -> bool:
         return scope is None or eligible_call_index in scope

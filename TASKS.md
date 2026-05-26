@@ -30,17 +30,21 @@
 - [x] Record branch information when `cond_or_uncond` is available.
 - [x] Record block/module metadata when available.
 - [x] Add compact top-token statistics.
+- [x] Add concept/phrase score records for `concept_terms`.
 - [x] Add summary records at step end or run finalize.
 
 ## Milestone 4: ComfyUI Node
 
 - [x] Implement `Anima Concept Survey Model Patch`.
 - [x] Inputs: `model`, `mode`, `capture_level`, `target_call_indices`, `branch_mode`, `jsonl_path`.
+- [x] Inputs: `clip`, `prompt_text`, `concept_terms`.
 - [x] Advanced inputs: `max_tokens`, `max_logits_mib`, `fail_mode`, `save_heatmaps`, `heatmap_dir`.
 - [x] Output patched `MODEL`.
 - [x] Reject existing `optimized_attention_override` with clear error.
 - [x] Log install summary.
 - [x] Keep `mode=off` as pass-through.
+- [x] Resolve relative `jsonl_path` and `heatmap_dir` under ComfyUI `output`.
+- [x] Use separate default output roots for JSONL logs and heatmaps.
 
 ## Milestone 5: Report Script
 
@@ -65,17 +69,22 @@
 - [x] Test report aggregation from fixture JSONL.
 - [x] Test top-token ranking.
 - [x] Test recommended target generation.
+- [x] Test ComfyUI-output-relative path resolution.
+- [x] Test concept phrase token matching.
+- [x] Test concept phrase heatmap export.
 
 ## Milestone 7: Manual Validation
 
-- [ ] Install/symlink project under ComfyUI `custom_nodes`.
-- [ ] Confirm node appears under `model_patches/anima`.
+- [x] Install/symlink project under ComfyUI `custom_nodes`.
+- [x] Confirm node appears/imports in ComfyUI.
 - [ ] Run true baseline without survey node.
 - [ ] Run observe mode with same seed/prompt/sampler.
 - [ ] Confirm generated image does not change in observe mode.
-- [ ] Confirm JSONL contains eligible attention calls.
-- [ ] Confirm q/k/v shape matches expected Anima path.
+- [x] Confirm JSONL contains eligible attention calls.
+- [x] Confirm q/k/v shape matches expected Anima path.
 - [ ] Confirm report script reads the JSONL.
+- [ ] Confirm `concept_terms` phrase heatmap output in a fresh ComfyUI run.
+- [ ] Confirm JSONL/heatmap defaults are clear in saved workflows after node refresh.
 
 ## Milestone 8: Heatmap Export
 
@@ -83,7 +92,12 @@
 - [x] Add 64x64 map export as `.npy`.
 - [x] Add PNG heatmap export.
 - [x] Add step/block/call filters.
-- [ ] Add top-token heatmap batch export.
+- [x] Add top-token heatmap batch export.
+- [x] Add 512px color preview PNGs.
+- [x] Add aggregate token heatmaps under `heatmaps/aggregate`.
+- [x] Add heatmap manifest files.
+- [x] Add phrase/concept heatmaps from `concept_terms` under `heatmaps/concepts`.
+- [x] Add aggregate phrase/concept heatmaps under `heatmaps/concepts/aggregate`.
 
 ## Milestone 9: Slider and Merge Integration
 
@@ -95,7 +109,7 @@
 
 ## Later
 
-- [ ] Add explicit concept list input.
+- [x] Add explicit concept list input.
 - [ ] Explore concept embedding extraction through ComfyUI CLIP/T5.
 - [ ] Add ConceptAttention-style output-space vector comparison.
 - [ ] Support rectangular image layouts.
