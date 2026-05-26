@@ -98,6 +98,7 @@
 - [x] Add heatmap manifest files.
 - [x] Add phrase/concept heatmaps from `concept_terms` under `heatmaps/concepts`.
 - [x] Add aggregate phrase/concept heatmaps under `heatmaps/concepts/aggregate`.
+- [x] Add `heatmap_output` selector to suppress unnecessary top-token heatmaps for phrase inspection.
 
 ## Milestone 9: Slider and Merge Integration
 

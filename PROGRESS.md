@@ -115,6 +115,7 @@ The first aggregate implementation also showed many other top tokens, including 
 - Added `concept_terms` input for phrase-level heatmaps.
 - Added phrase/concept heatmaps under `heatmaps/concepts`.
 - Added phrase/concept aggregate heatmaps under `heatmaps/concepts/aggregate`.
+- Added `heatmap_output` selector so phrase inspection can use `concepts_only` without writing unrelated top-token heatmaps.
 - Added unit tests for parser, progress, branch selection, observe passthrough, fallback, and reporting.
 - Added tests for path resolution, concept phrase matching, and concept heatmap export.
 - Verified with `python -m pytest -q`: 14 passed, 5 subtests passed.
@@ -133,6 +134,7 @@ Manual ComfyUI validation:
 2. Run a fresh workflow with:
    - `capture_level=heatmap`
    - `save_heatmaps=true`
+   - `heatmap_output=concepts_only`
    - `prompt_text` equal to the actual generation prompt
    - `concept_terms=big breasts`
    - a clean `heatmap_dir`, such as `anima_concept_survey/heatmaps_big_breasts`

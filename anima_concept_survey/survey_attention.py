@@ -22,6 +22,7 @@ MODES = ["observe", "off"]
 CAPTURE_LEVELS = ["summary", "tokens", "heatmap"]
 BRANCH_MODES = ["both", "positive_only", "negative_only"]
 FAIL_MODES = ["fallback", "raise"]
+HEATMAP_OUTPUTS = ["concepts_only", "tokens_only", "tokens_and_concepts"]
 DEFAULT_OUTPUT_SUBDIR = "anima_concept_survey"
 DEFAULT_JSONL_RELATIVE_PATH = f"{DEFAULT_OUTPUT_SUBDIR}/logs/survey.jsonl"
 DEFAULT_HEATMAP_RELATIVE_DIR = f"{DEFAULT_OUTPUT_SUBDIR}/heatmaps"
@@ -39,6 +40,7 @@ class SurveyConfig:
     jsonl_path: str | None = None
     save_heatmaps: bool = False
     heatmap_dir: str | None = None
+    heatmap_output: str = "concepts_only"
     max_logits_mib: float = 1024.0
     fail_mode: str = "fallback"
     prompt_text: str = ""
@@ -54,6 +56,8 @@ class SurveyConfig:
             raise ValueError(f"Unsupported branch_mode: {self.branch_mode!r}")
         if self.fail_mode not in FAIL_MODES:
             raise ValueError(f"Unsupported fail_mode: {self.fail_mode!r}")
+        if self.heatmap_output not in HEATMAP_OUTPUTS:
+            raise ValueError(f"Unsupported heatmap_output: {self.heatmap_output!r}")
         parse_call_index_scope(self.target_call_indices)
         parse_call_index_scope(self.diagnostic_call_indices)
         if self.max_tokens <= 0:
@@ -527,8 +531,10 @@ class AnimaConceptSurveyAttentionOverride:
 
     def finalize(self) -> None:
         if self.config.capture_level == "heatmap" and self.config.save_heatmaps:
-            self._save_aggregate_heatmaps()
-            self._save_aggregate_concept_heatmaps()
+            if self._wants_token_heatmaps():
+                self._save_aggregate_heatmaps()
+            if self._wants_concept_heatmaps():
+                self._save_aggregate_concept_heatmaps()
         self._emit_jsonl(self._run_summary_record())
 
     def __call__(self, original_func: Callable, *args: Any, **kwargs: Any) -> torch.Tensor:
@@ -658,7 +664,9 @@ class AnimaConceptSurveyAttentionOverride:
             branch_index = torch.tensor(positions, dtype=torch.long, device=attention_probs.device)
             branch_probs = attention_probs.index_select(0, branch_index)
             token_scores = []
-            if self.config.capture_level in ("tokens", "heatmap"):
+            if self.config.capture_level == "tokens" or (
+                self.config.capture_level == "heatmap" and self._wants_token_heatmaps()
+            ):
                 token_scores = _token_scores_from_attention(branch_probs, self.config.max_tokens)
                 for token in token_scores:
                     token_meta = self.token_text_map.get(int(token["token_index"]))
@@ -670,7 +678,7 @@ class AnimaConceptSurveyAttentionOverride:
                             "token_weight": token_meta.get("weight"),
                         })
             concept_scores = []
-            if self.config.capture_level == "heatmap" and self.concept_token_groups:
+            if self.config.capture_level == "heatmap" and self._wants_concept_heatmaps() and self.concept_token_groups:
                 concept_scores = self._concept_scores_from_attention(branch_probs, spatial)
             record = {
                 "schema_version": 1,
@@ -702,8 +710,16 @@ class AnimaConceptSurveyAttentionOverride:
             }
             self._emit_jsonl(record)
             if self.config.capture_level == "heatmap" and self.config.save_heatmaps:
-                self._save_heatmaps(branch_probs, token_scores, spatial, progress, eligible_call_index, branch, record)
-                self._save_concept_heatmaps(concept_scores, spatial, progress, eligible_call_index, branch)
+                if self._wants_token_heatmaps():
+                    self._save_heatmaps(branch_probs, token_scores, spatial, progress, eligible_call_index, branch, record)
+                if self._wants_concept_heatmaps():
+                    self._save_concept_heatmaps(concept_scores, spatial, progress, eligible_call_index, branch)
+
+    def _wants_token_heatmaps(self) -> bool:
+        return self.config.heatmap_output in ("tokens_only", "tokens_and_concepts")
+
+    def _wants_concept_heatmaps(self) -> bool:
+        return self.config.heatmap_output in ("concepts_only", "tokens_and_concepts")
 
     def _save_heatmaps(
         self,

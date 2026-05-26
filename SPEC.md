@@ -124,6 +124,7 @@ Inputs:
 - `jsonl_path`: optional output path
 - `save_heatmaps`: bool
 - `heatmap_dir`: optional output dir
+- `heatmap_output`: `concepts_only`, `tokens_only`, `tokens_and_concepts`
 - `max_logits_mib`: VRAM guard
 - `fail_mode`: `fallback`, `raise`
 
@@ -140,6 +141,9 @@ Behavior:
 - `jsonl_path` と `heatmap_dir` の相対パスはComfyUIの `output` ディレクトリ基準で解決する
 - デフォルトJSONLは `anima_concept_survey/logs/survey.jsonl`
 - デフォルトheatmap出力先は `anima_concept_survey/heatmaps`
+- `heatmap_output=concepts_only` では `concept_terms` のphrase heatmapだけを保存し、不要なtop-token heatmapを省く
+- `heatmap_output=tokens_only` では従来のtop-token heatmapだけを保存する
+- `heatmap_output=tokens_and_concepts` では診断用に両方を保存する
 - 既存の `optimized_attention_override` がある場合はエラーにする
 - fallback reasonを必ず記録する
 - 観測ができないattention callはoriginal backendへ戻す

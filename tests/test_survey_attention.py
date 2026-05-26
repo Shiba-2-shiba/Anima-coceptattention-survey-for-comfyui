@@ -191,6 +191,7 @@ class SurveyAttentionTests(unittest.TestCase):
                 capture_level="heatmap",
                 save_heatmaps=True,
                 heatmap_dir=str(heatmap_dir),
+                heatmap_output="tokens_only",
                 max_tokens=2,
             ))
             override(
