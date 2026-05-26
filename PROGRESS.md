@@ -116,6 +116,7 @@ The first aggregate implementation also showed many other top tokens, including 
 - Added phrase/concept heatmaps under `heatmaps/concepts`.
 - Added phrase/concept aggregate heatmaps under `heatmaps/concepts/aggregate`.
 - Added `heatmap_output` selector so phrase inspection can use `concepts_only` without writing unrelated top-token heatmaps.
+- Added saved-heatmap statistics to manifest files: `heatmap_mean`, `heatmap_max`, `heatmap_std`, `heatmap_max_over_mean`.
 - Added unit tests for parser, progress, branch selection, observe passthrough, fallback, and reporting.
 - Added tests for path resolution, concept phrase matching, and concept heatmap export.
 - Verified with `python -m pytest -q`: 14 passed, 5 subtests passed.

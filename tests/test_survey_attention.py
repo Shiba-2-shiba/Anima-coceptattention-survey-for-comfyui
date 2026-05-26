@@ -1,8 +1,10 @@
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from anima_concept_survey.survey_attention import (
@@ -209,6 +211,11 @@ class SurveyAttentionTests(unittest.TestCase):
             self.assertGreaterEqual(len(list(heatmap_dir.glob("*.npy"))), 2)
             self.assertGreaterEqual(len(list(heatmap_dir.glob("*.png"))), 2)
             self.assertTrue((heatmap_dir / "manifest.json").exists())
+            manifest = json.loads((heatmap_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertIn("heatmap_mean", manifest[0])
+            self.assertIn("heatmap_max", manifest[0])
+            self.assertIn("heatmap_std", manifest[0])
+            self.assertIn("heatmap_max_over_mean", manifest[0])
             self.assertGreaterEqual(len(list((heatmap_dir / "aggregate").glob("*_preview.png"))), 2)
             self.assertTrue((heatmap_dir / "aggregate" / "manifest.json").exists())
 
@@ -253,6 +260,13 @@ class SurveyAttentionTests(unittest.TestCase):
             self.assertTrue((heatmap_dir / "concepts" / "manifest.json").exists())
             self.assertTrue((heatmap_dir / "concepts" / "aggregate" / "manifest.json").exists())
             self.assertGreaterEqual(len(list((heatmap_dir / "concepts" / "aggregate").glob("*big_breasts_preview.png"))), 1)
+            manifest = json.loads((heatmap_dir / "concepts" / "aggregate" / "manifest.json").read_text(encoding="utf-8"))
+            row = manifest[0]
+            arr = np.load(heatmap_dir / "concepts" / "aggregate" / row["npy"])
+            self.assertTrue(math.isclose(row["heatmap_mean"], float(arr.mean()), rel_tol=1e-6))
+            self.assertTrue(math.isclose(row["heatmap_max"], float(arr.max()), rel_tol=1e-6))
+            self.assertTrue(math.isclose(row["heatmap_std"], float(arr.std()), rel_tol=1e-6))
+            self.assertTrue(math.isclose(row["heatmap_max_over_mean"], float(arr.max() / arr.mean()), rel_tol=1e-6))
 
 
 if __name__ == "__main__":

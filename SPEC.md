@@ -240,6 +240,7 @@ Expected files:
 - optional concept heatmaps under `heatmaps/concepts`
 - optional concept aggregate heatmaps under `heatmaps/concepts/aggregate`
 - heatmap `manifest.json` files mapping token/concept metadata to image files
+- heatmap manifests include saved-array statistics: `heatmap_mean`, `heatmap_max`, `heatmap_std`, `heatmap_max_over_mean`
 
 ## Metrics
 

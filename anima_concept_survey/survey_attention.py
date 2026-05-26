@@ -514,6 +514,20 @@ def _public_concept_record(concept: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _heatmap_stats(heatmap: Any) -> dict[str, float]:
+    import numpy as np
+
+    arr = np.asarray(heatmap, dtype=np.float32)
+    mean_value = float(arr.mean())
+    max_value = float(arr.max())
+    return {
+        "heatmap_mean": mean_value,
+        "heatmap_max": max_value,
+        "heatmap_std": float(arr.std()),
+        "heatmap_max_over_mean": max_value / mean_value if mean_value else 0.0,
+    }
+
+
 class AnimaConceptSurveyAttentionOverride:
     def __init__(self, config: SurveyConfig, clip: Any | None = None):
         config.validate()
@@ -758,6 +772,7 @@ class AnimaConceptSurveyAttentionOverride:
                 "block": record.get("block"),
                 "spatial": list(spatial),
                 "token": token,
+                **_heatmap_stats(heatmap),
             })
         self._write_heatmap_manifest(out_dir, manifest_rows)
         self._save_aggregate_heatmaps()
@@ -818,6 +833,7 @@ class AnimaConceptSurveyAttentionOverride:
                 "eligible_call_index": eligible_call_index,
                 "branch": branch,
                 "spatial": list(spatial),
+                **_heatmap_stats(heatmap),
                 **_public_concept_record(concept),
             })
         self._write_heatmap_manifest(out_dir, manifest_rows)
@@ -892,6 +908,7 @@ class AnimaConceptSurveyAttentionOverride:
                 "observation_count": acc.count,
                 "score_mean": acc.score_sum / acc.count if acc.count else None,
                 "score_max": acc.score_max,
+                **_heatmap_stats(heatmap),
                 **acc.token_meta,
             })
         (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
@@ -925,6 +942,7 @@ class AnimaConceptSurveyAttentionOverride:
                 "observation_count": acc.count,
                 "score_mean": acc.score_sum / acc.count if acc.count else None,
                 "score_max": acc.score_max,
+                **_heatmap_stats(heatmap),
             })
         (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
