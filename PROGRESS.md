@@ -1,35 +1,65 @@
-# Progress
+# PROGRESS.md — Codex Refactor Progress
+
+Project: Anima ConceptAttention Survey for ComfyUI  
+Focus: `concept_terms` heatmap correctness and modular refactor
+
+---
 
 ## Current Status
 
-Status: MVP implementation is working and unit-tested; ComfyUI import and attention logging have been manually observed.
+Status: automated refactor is complete through documentation alignment. The highest-risk `concept_terms` matching path now has source-scoped matching, source-local token indices, explicit diagnostics, out-of-range guards, concept scoring tests, concept-aware reporting, and aligned README/SPEC/TASKS documentation.
 
-The repository now contains a ComfyUI V3 node, observe-only attention override, JSONL records, report scripts, token heatmaps, aggregate heatmaps, phrase heatmaps via `concept_terms`, and synthetic tensor tests.
+The current repository already has:
 
-## Decisions Made
+- ComfyUI V3 node registration.
+- `Anima Concept Survey Model Patch`.
+- observe-only attention override.
+- JSONL attention observation records.
+- token heatmap export.
+- aggregate token heatmaps.
+- `concept_terms` input.
+- phrase/concept heatmaps under `heatmaps/concepts`.
+- aggregate concept heatmaps under `heatmaps/concepts/aggregate`.
+- manifest statistics for saved heatmaps.
+- report scripts.
+- synthetic tests for concept phrase matching and concept heatmap export.
 
-### 2026-05-26
+Main remaining unresolved issue:
 
-- Chose a ComfyUI `optimized_attention_override` based observer as the first implementation path.
-- Decided not to port the full ConceptAttention Flux pipeline into Anima for MVP.
-- Decided to reuse the proven AFM observation path as the closest local reference.
-- Decided that the first useful artifact is machine-readable attention survey data, not a trained LoRA or merge.
-- Decided that output should support downstream slider/merge workflows through CSV/JSON reports.
+- The system still relies on flattened `clip.tokenize(prompt_text)` global token indices matching runtime attention key order. This assumption is now auditable and guarded by runtime `text_len` checks, but still needs manual ComfyUI validation with actual Anima workflows.
 
-### 2026-05-27
+---
 
-- Decided that `heatmap` mode should still write JSONL because PNG/NPY files cannot preserve token text, call, step, branch, and score metadata.
-- Separated default JSONL and heatmap output locations:
-  - JSONL: `anima_concept_survey/logs/survey.jsonl`
-  - heatmaps: `anima_concept_survey/heatmaps`
-- Added `concept_terms` as a phrase-level heatmap input rather than requiring users to manually interpret individual tokenizer tokens.
-- Kept `concept_terms` as token-attention summation over the existing prompt tokens, not a separate ConceptAttention concept stream.
+## Decisions Carried Forward
 
-## Evidence Collected
+### Existing MVP decisions
 
-### AFM Runtime Evidence
+- Use ComfyUI `optimized_attention_override` for observation.
+- Keep mode observe-only.
+- Do not port full ConceptAttention concept-vector stream yet.
+- Interpret MVP concept heatmaps as summed prompt-token cross-attention, not final-image segmentation.
+- Keep JSONL output even in heatmap mode because image files alone lose token/call/step/branch metadata.
+- Save phrase heatmaps under `heatmaps/concepts`.
+- Use `heatmap_output=concepts_only` for phrase inspection without unrelated top-token heatmaps.
 
-`AFM-for-anima-experimental` already captures Anima/Cosmos cross-attention calls with stable square image-query layout:
+### New refactor decisions
+
+- Treat `concept_terms` correctness as the highest priority.
+- Split monolithic `survey_attention.py` into small modules.
+- Add concept matching data classes.
+- Add source-local token indexing.
+- Add concept diagnostics for unmatched, ambiguous, and out-of-range terms.
+- Do not silently create concept heatmaps for ambiguous source matches.
+- Add `survey_by_concept.csv` to reporting.
+- Keep JSONL schema version 1 and add optional fields rather than breaking existing records.
+
+---
+
+## Evidence Already Collected
+
+### Runtime shape evidence
+
+Known Anima/Cosmos cross-attention shape from manual observation:
 
 ```text
 q=(2, 16, 4096, 128)
@@ -38,127 +68,355 @@ v=(2, 16, 512, 128)
 spatial=(64, 64)
 ```
 
-This validates that an observer node can inspect the attention calls needed for a first survey implementation.
+This indicates image latent queries attending over 512 text key positions.
 
-### ConceptAttention Design Evidence
+### Token text evidence
 
-`ConceptAttention` computes heatmaps from vectors by comparing image vectors and concept vectors across selected layers/timesteps.
-
-MVP adaptation:
-
-- Use existing prompt/text keys first.
-- Add explicit concept vectors later.
-
-### exploring-mmdit Design Evidence
-
-`exploring-mmdit` separates T2I and I2T attention regions for Flux/SD3 and aggregates attention by timestep/block.
-
-MVP adaptation:
-
-- Use this as the analysis/reporting model.
-- Do not copy the diffusers attention processor path directly.
-
-### Slider Node Connection
-
-`Comfyui-anima-slider-node` already targets Anima modules such as:
-
-- cross attention projections
-- self attention projections
-- MLP layers
-
-Survey reports should rank block/call/token importance so those target patterns can be narrowed.
-
-### Manual Runtime Evidence
-
-A ComfyUI run with `prompt_text="big breasts,"` produced eligible cross-attention observations:
+Manual run with:
 
 ```text
-q_shape=[2, 16, 4096, 128]
-k_shape=[2, 16, 512, 128]
-v_shape=[2, 16, 512, 128]
-spatial=[64, 64]
-branch=positive
-text_len=512
-image_len=4096
+prompt_text="big breasts,"
 ```
 
-The token map decoded:
+produced decoded token records similar to:
 
-- `token_index=0`, `token_text="big"`, `token_source="qwen3_06b"`
-- `token_index=1`, `token_text=" breasts"`, `token_source="qwen3_06b"`
+```text
+token_index=0, token_text="big", token_source="qwen3_06b"
+token_index=1, token_text=" breasts", token_source="qwen3_06b"
+```
 
-The first aggregate implementation also showed many other top tokens, including undecoded tokens. This confirmed that token aggregate heatmaps answer "which individual tokens ranked high", not "show only this phrase". `concept_terms` was added to address that gap.
+This validates the expected `big breasts` unit-test fixture, but more diagnostics are needed for other CLIP/tokenizer variants.
 
-## Completed
+### Test evidence
 
-- Reviewed reference repository layout.
-- Reviewed README files for all four reference repositories.
-- Identified AFM observe path as the lowest-risk ComfyUI integration point.
-- Identified ConceptAttention vector/heatmap logic as a later-stage enhancement.
-- Defined MVP node and report outputs.
-- Created project planning documents:
-  - `SPEC.md`
-  - `PROGRESS.md`
-  - `TASKS.md`
-- Added ComfyUI package entrypoint and V3 node registration.
-- Added `Anima Concept Survey Model Patch`.
-- Added observe-only `AnimaConceptSurveyAttentionOverride`.
-- Added JSONL attention observation/fallback/skipped/run-summary records.
-- Added report aggregation helpers and CLI scripts.
-- Added CLIP/prompt-based token text restoration.
-- Added top-token `.npy` and grayscale `.png` heatmap export.
-- Added ComfyUI-output-relative path resolution for `jsonl_path` and `heatmap_dir`.
-- Added default JSONL path under `anima_concept_survey/logs`.
-- Added top-token 512px color preview PNGs.
-- Added token aggregate heatmaps under `heatmaps/aggregate`.
-- Added heatmap manifest files.
-- Added `concept_terms` input for phrase-level heatmaps.
-- Added phrase/concept heatmaps under `heatmaps/concepts`.
-- Added phrase/concept aggregate heatmaps under `heatmaps/concepts/aggregate`.
-- Added `heatmap_output` selector so phrase inspection can use `concepts_only` without writing unrelated top-token heatmaps.
-- Added saved-heatmap statistics to manifest files: `heatmap_mean`, `heatmap_max`, `heatmap_std`, `heatmap_max_over_mean`.
-- Added unit tests for parser, progress, branch selection, observe passthrough, fallback, and reporting.
-- Added tests for path resolution, concept phrase matching, and concept heatmap export.
-- Verified with `python -m pytest -q`: 14 passed, 5 subtests passed.
-- Confirmed ComfyUI can import the node.
-- Confirmed JSONL contains eligible Anima-like cross-attention calls in a manual run.
+Existing tests include:
 
-## In Progress
+- call-index parser
+- square spatial inference
+- ComfyUI path resolution
+- progress from sigmas
+- branch selection
+- observe-mode passthrough
+- unsupported shape fallback
+- token heatmap export
+- concept phrase matching
+- concept phrase heatmap export
+- report aggregation
 
-- Fresh ComfyUI validation of the new `concept_terms` output path.
-
-## Next Milestone
-
-Manual ComfyUI validation:
-
-1. Restart ComfyUI so the new `concept_terms` input is loaded.
-2. Run a fresh workflow with:
-   - `capture_level=heatmap`
-   - `save_heatmaps=true`
-   - `heatmap_output=concepts_only`
-   - `prompt_text` equal to the actual generation prompt
-   - `concept_terms=big breasts`
-   - a clean `heatmap_dir`, such as `anima_concept_survey/heatmaps_big_breasts`
-3. Confirm `heatmaps_big_breasts/concepts/aggregate/aggregate_positive_concept_big_breasts_preview.png` is created.
-4. Confirm `concept_scores` appears in JSONL attention observation records.
-5. Run fixed-seed baseline without the node.
-6. Run fixed-seed observe mode with the node.
-7. Confirm image output is unchanged by observe mode.
-
-## Open Questions
-
-- Can token text be recovered reliably from every connected `CLIP` variant, or do some Anima loaders require model-specific decoder adapters?
-- Does Anima always expose text length 512 for relevant runs, or should text length be inferred per call?
-- Should heatmap export remain in the node itself, or should heavier aggregate/overlay outputs move to a report/postprocess script?
-- Should the project directory be renamed from `coceptattention` to `conceptattention`?
-- Should an image overlay node be added to render concept heatmaps over the final generated image?
-- Should `concept_terms` support explicit tokenizer-source selection when multiple encoders expose overlapping token streams?
+---
 
 ## Known Risks
 
-- Runtime token ordering must be verified from Anima logs before labeling T2I/I2T semantics.
-- Observe mode must call the original attention backend to avoid changing generated images.
-- Full attention logits are large; top-k/sampled summaries may be necessary for practical VRAM use.
-- Composing with other `optimized_attention_override` nodes is out of scope for MVP.
-- Token aggregate heatmaps can include undecoded internal/special tokens, so phrase-level inspection should use `concept_terms`.
-- `concept_terms` currently sums matched prompt-token attention; it is not a separate encoded concept stream and is not a final-image segmentation mask.
+### R1. Token index alignment risk
+
+`token_index` from `clip.tokenize(prompt_text)` may not always match runtime `text_key` order.
+
+Mitigation:
+
+- Store `source_token_index`.
+- Record token map in run summary.
+- Verify matched token indices are within runtime `text_len`.
+- Emit diagnostics on mismatch.
+- Add manual validation using actual Anima JSONL.
+
+### R2. Cross-source false match risk
+
+The same phrase may decode from multiple tokenizer streams.
+
+Mitigation:
+
+- Match per source.
+- Do not join across sources.
+- Treat multi-source matches as ambiguous unless user supplies `source:term`.
+
+### R3. Punctuation normalization risk
+
+Current normalization can skip punctuation-only tokens, which may unintentionally match across punctuation.
+
+Mitigation:
+
+- Keep backward-compatible normalization.
+- Record ignored punctuation token indices and warnings.
+- Add tests.
+
+### R4. Duplicate phrase risk
+
+A concept may appear multiple times in the prompt.
+
+Mitigation:
+
+- Emit occurrence-indexed matches.
+- Add tests for duplicate occurrences.
+
+### R5. Heavy runtime I/O risk
+
+Writing PNG/NPY during sampling may slow generation.
+
+Mitigation:
+
+- Keep current behavior for MVP.
+- Move expensive rendering to postprocess later if needed.
+- Ensure `concepts_only` avoids top-token heatmap noise.
+
+### R6. Finalize lifecycle risk
+
+`finalize()` may not always be called in real ComfyUI runs.
+
+Mitigation:
+
+- Write per-call concept heatmaps immediately as now.
+- Ensure reports can work from attention observations without run summary.
+- Later: design a safer lifecycle hook or report-time aggregation.
+
+---
+
+## Milestone Status
+
+### M0. Planning Documents
+
+Status: completed
+
+- [x] Create Codex-focused SPEC.md.
+- [x] Create Codex-focused PROGRESS.md.
+- [x] Create Codex-focused TASKS.md.
+
+### M1. Characterization Tests
+
+Status: completed
+
+Goal: preserve current behavior before moving code.
+
+- [x] Add tests for current concept heatmap math.
+- [x] Add tests for `concepts_only` output behavior.
+- [x] Add tests for no cross-source matching.
+- [x] Add tests for unmatched concept diagnostics after implementation.
+
+### M2. Module Extraction Without Behavior Change
+
+Status: completed
+
+Goal: split pure helpers from `survey_attention.py` while keeping tests green.
+
+Planned modules:
+
+- `config.py` — completed.
+- `paths.py` — completed.
+- `progress.py` — completed.
+- `branches.py` — completed.
+- `selectors.py` — completed.
+- `metadata.py` — completed.
+- `concepts.py` — completed.
+- `scoring.py` — completed.
+- `heatmaps.py` — completed.
+- `records.py` — completed.
+- `writer.py` — completed.
+- `override.py` — completed.
+
+### M3. Concept Matching Rewrite
+
+Status: completed
+
+Goal: replace current `ConceptTokenGroup` logic with auditable match records.
+
+Required additions:
+
+- `ConceptTermSpec`
+- `ConceptTokenMatch`
+- `ConceptMatchReport`
+- [x] source prefix parsing
+- [x] source-local token indices
+- [x] duplicate occurrence support
+- [x] ambiguity diagnostics
+- [x] ignored punctuation diagnostics
+
+### M4. Concept Heatmap Correctness
+
+Status: completed
+
+Goal: prove concept heatmaps equal summed matched-token attention probability mass.
+
+Required work:
+
+- [x] Extract concept scoring into `scoring.py`.
+- [x] Test deterministic tiny tensors.
+- [x] Test `.npy` raw values.
+- [x] Test manifest statistics.
+- [x] Test branch separation.
+
+### M5. JSONL Diagnostics
+
+Status: completed
+
+Goal: make missing or ambiguous concept heatmaps explainable.
+
+Required events:
+
+- [x] `concept_match_summary`
+- [x] `concept_unmatched`
+- [x] `concept_alignment_warning`
+
+### M6. Reporting Extension
+
+Status: completed
+
+Goal: make report scripts useful for phrase-level analysis.
+
+Implemented output:
+
+```text
+survey_by_concept.csv
+```
+
+Implemented updates:
+
+- [x] include concept score summaries in `survey_summary.json`
+- [x] include concept section in Markdown report
+- [x] do not break reports when `token_scores` are empty
+
+### M7. Manual ComfyUI Validation
+
+Status: pending
+
+Manual validation checklist:
+
+- [ ] Restart ComfyUI after refactor.
+- [ ] Run fixed seed baseline without survey node.
+- [ ] Run fixed seed observe mode with survey node.
+- [ ] Confirm output image does not change.
+- [ ] Use `capture_level=heatmap`.
+- [ ] Use `save_heatmaps=true`.
+- [ ] Use `heatmap_output=concepts_only`.
+- [ ] Use exact `prompt_text` from generation prompt.
+- [ ] Use `concept_terms=big breasts`.
+- [ ] Confirm aggregate concept preview exists.
+- [ ] Confirm JSONL has `concept_match_summary`.
+- [ ] Confirm JSONL has `attention_observation.concept_scores`.
+- [ ] Confirm report script creates `survey_by_concept.csv`.
+
+---
+
+## Current Next Step for Codex
+
+Continue with manual ComfyUI validation when a runtime is available.
+
+Automated tests are green after module extraction and documentation alignment. Manual ComfyUI validation is still pending.
+
+---
+
+## Progress Log Template
+
+Append future work here using this format:
+
+```text
+### YYYY-MM-DD — <short title>
+
+Changed:
+- ...
+
+Tests:
+- command: python -m pytest -q
+- result: ...
+
+Notes:
+- ...
+
+Next:
+- ...
+```
+
+---
+
+## Change Log
+
+### 2026-05-28 — Codex refactor plan created
+
+Changed:
+
+- Added Codex-focused planning docs for concept heatmap correctness.
+- Defined stricter meaning of correct `concept_terms` heatmaps.
+- Defined module split plan.
+- Defined diagnostics for unmatched and ambiguous concept terms.
+- Defined concept-aware report requirements.
+
+Tests:
+
+- Not run. Documentation-only update.
+
+Next:
+
+- Add characterization tests before refactoring implementation.
+
+### 2026-05-28 — P0-P5/P7 concept correctness pass
+
+Changed:
+
+- Added characterization tests for exact passthrough, `concepts_only` token-file suppression, deterministic concept heatmap math, unmatched diagnostics, and out-of-range concept guards.
+- Extracted pure infrastructure modules: `config.py`, `paths.py`, `progress.py`, `branches.py`, `selectors.py`, and `metadata.py`.
+- Added `source_token_index` to token flattening and token text records.
+- Added `concepts.py` with source-prefixed parsing, source-scoped matching, duplicate occurrence records, ambiguity handling, fallback-token exclusion, and ignored punctuation diagnostics.
+- Replaced runtime concept scoring inputs with `ConceptMatchReport` / `ConceptTokenMatch` while keeping `build_concept_token_groups` as a compatibility wrapper.
+- Added `scoring.py` for token and concept score calculation.
+- Added JSONL `concept_match_summary`, `concept_unmatched`, and `concept_alignment_warning` events.
+- Added concept report aggregation and `survey_by_concept.csv`; reports tolerate empty `token_scores`.
+
+Tests:
+
+- command: python -m pytest -q
+- result: 28 passed, 7 subtests passed
+
+Notes:
+
+- Runtime token-key alignment is now diagnosable and guarded by `text_len`, but still needs manual ComfyUI validation.
+- `heatmaps.py`, `records.py`, `writer.py`, and `override.py` extraction remain.
+
+Next:
+
+- Extract heatmap writing and record/writer helpers without changing behavior.
+
+### 2026-05-28 — Heatmap/record/writer/override extraction
+
+Changed:
+
+- Added `heatmaps.py` with heatmap accumulators, PNG/NPY writing, manifest writing, and aggregate save logic.
+- Added `records.py` helpers for skipped/fallback records, concept diagnostics, public concept filtering, and run summaries.
+- Added `writer.py` with `JsonlWriter`.
+- Moved the runtime observer implementation to `override.py`.
+- Kept `survey_attention.py` as a compatibility export surface for existing imports.
+- Wrapped observer-side computation in `torch.no_grad()`.
+
+Tests:
+
+- command: python -m pytest -q
+- result: 28 passed, 7 subtests passed
+
+Notes:
+
+- `survey_attention.py` is now a re-export layer; new implementation work should target the responsibility-specific modules.
+- Manual ComfyUI validation remains pending.
+
+Next:
+
+- Update README/SPEC to match the final module layout and run manual validation when a ComfyUI runtime is available.
+
+### 2026-05-28 — Documentation alignment and branch coverage
+
+Changed:
+
+- Added an automated concept heatmap branch-separation test for positive and negative branches.
+- Updated README with source-prefixed `concept_terms`, diagnostics, concept heatmap interpretation, `survey_by_concept.csv`, package layout, and manual validation protocol.
+- Updated SPEC to describe the implemented module split and `survey_attention.py` compatibility surface.
+- Updated TASKS/PROGRESS completion states.
+
+Tests:
+
+- command: python -m pytest -q
+- result: 29 passed, 7 subtests passed
+
+Notes:
+
+- Automated refactor work is complete against the local test suite.
+- Manual ComfyUI validation remains the main remaining acceptance item.
+
+Next:
+
+- Run fixed-seed ComfyUI observe invariance and fresh `concept_terms=big breasts` validation.

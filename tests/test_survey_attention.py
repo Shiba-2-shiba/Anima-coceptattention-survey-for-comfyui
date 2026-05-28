@@ -152,12 +152,42 @@ class SurveyAttentionTests(unittest.TestCase):
 
             records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
             observations = [record for record in records if record.get("event") == "attention_observation"]
+            summary = next(record for record in records if record.get("event") == "run_summary")
             self.assertEqual(len(observations), 2)
             self.assertEqual({record["branch"] for record in observations}, {"negative", "positive"})
             self.assertEqual(observations[0]["spatial"], [4, 4])
             self.assertEqual(observations[0]["block"], "7")
             self.assertEqual(len(observations[0]["token_scores"]), 3)
             self.assertIn("token_text", observations[0]["token_scores"][0])
+            self.assertEqual(summary["token_sources"], ["l"])
+            self.assertEqual(summary["token_text_map"][0]["source_token_index"], 0)
+
+    def test_observe_mode_returns_backend_sentinel_exactly(self):
+        torch.manual_seed(23)
+        q = torch.randn(1, 2, 16, 4)
+        k = torch.randn(1, 2, 5, 4)
+        v = torch.randn(1, 2, 5, 4)
+        sentinel = torch.randn(1, 16, 8)
+
+        def original(*args, **kwargs):
+            del args, kwargs
+            return sentinel
+
+        override = AnimaConceptSurveyAttentionOverride(SurveyConfig(prompt_text="hello"))
+        out = override(
+            original,
+            q,
+            k,
+            v,
+            2,
+            skip_reshape=True,
+            transformer_options={
+                "sigmas": torch.tensor([0.5]),
+                "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
+            },
+        )
+
+        self.assertIs(out, sentinel)
 
     def test_unsupported_shape_falls_back_to_original(self):
         q = torch.randn(2, 2, 15, 4)
@@ -255,10 +285,17 @@ class SurveyAttentionTests(unittest.TestCase):
             override.finalize()
             records = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
             observation = next(record for record in records if record.get("event") == "attention_observation")
+            summary = next(record for record in records if record.get("event") == "run_summary")
             self.assertEqual(observation["concept_scores"][0]["term"], "big breasts")
             self.assertEqual(observation["concept_scores"][0]["token_indices"], [0, 1])
+            self.assertEqual(observation["concept_scores"][0]["source_token_indices"], [0, 1])
+            self.assertEqual(summary["concept_match_count"], 1)
+            self.assertEqual(summary["concept_unmatched_terms"], [])
+            self.assertEqual(summary["concept_ambiguous_terms"], [])
             self.assertTrue((heatmap_dir / "concepts" / "manifest.json").exists())
             self.assertTrue((heatmap_dir / "concepts" / "aggregate" / "manifest.json").exists())
+            self.assertEqual(list(heatmap_dir.glob("step*_token*.npy")), [])
+            self.assertEqual(list(heatmap_dir.glob("step*_token*.png")), [])
             self.assertGreaterEqual(len(list((heatmap_dir / "concepts" / "aggregate").glob("*big_breasts_preview.png"))), 1)
             manifest = json.loads((heatmap_dir / "concepts" / "aggregate" / "manifest.json").read_text(encoding="utf-8"))
             row = manifest[0]
@@ -267,6 +304,149 @@ class SurveyAttentionTests(unittest.TestCase):
             self.assertTrue(math.isclose(row["heatmap_max"], float(arr.max()), rel_tol=1e-6))
             self.assertTrue(math.isclose(row["heatmap_std"], float(arr.std()), rel_tol=1e-6))
             self.assertTrue(math.isclose(row["heatmap_max_over_mean"], float(arr.max() / arr.mean()), rel_tol=1e-6))
+
+    def test_unmatched_concept_terms_emit_jsonl_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jsonl_path = Path(tmp) / "survey.jsonl"
+            AnimaConceptSurveyAttentionOverride(SurveyConfig(
+                jsonl_path=str(jsonl_path),
+                concept_terms="missing term",
+                token_text_map={
+                    0: {"token_index": 0, "source_token_index": 0, "token_text": "big", "token_source": "qwen"},
+                },
+            ))
+
+            records = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(records[0]["event"], "concept_match_summary")
+            unmatched = next(record for record in records if record.get("event") == "concept_unmatched")
+            self.assertEqual(unmatched["term"], "missing term")
+            self.assertEqual(unmatched["available_sources"], ["qwen"])
+
+    def test_concept_heatmaps_preserve_positive_negative_branch_separation(self):
+        torch.manual_seed(42)
+        q = torch.randn(2, 2, 16, 4)
+        k = torch.randn(2, 2, 5, 4)
+        v = torch.randn(2, 2, 5, 4)
+        with tempfile.TemporaryDirectory() as tmp:
+            jsonl_path = Path(tmp) / "survey.jsonl"
+            heatmap_dir = Path(tmp) / "heatmaps"
+            override = AnimaConceptSurveyAttentionOverride(SurveyConfig(
+                jsonl_path=str(jsonl_path),
+                capture_level="heatmap",
+                save_heatmaps=True,
+                heatmap_dir=str(heatmap_dir),
+                concept_terms="big breasts",
+                token_text_map={
+                    0: {"token_index": 0, "source_token_index": 0, "token_text": "big", "token_source": "qwen"},
+                    1: {"token_index": 1, "source_token_index": 1, "token_text": " breasts", "token_source": "qwen"},
+                },
+            ))
+            override(
+                reference_attention,
+                q,
+                k,
+                v,
+                2,
+                skip_reshape=True,
+                transformer_options={
+                    "sigmas": torch.tensor([0.5]),
+                    "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
+                    "cond_or_uncond": [1, 0],
+                },
+            )
+            override.finalize()
+
+            records = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+            observations = [record for record in records if record.get("event") == "attention_observation"]
+            self.assertEqual({record["branch"] for record in observations}, {"negative", "positive"})
+            self.assertTrue(all(record["concept_scores"] for record in observations))
+
+            manifest = json.loads((heatmap_dir / "concepts" / "aggregate" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual({row["branch"] for row in manifest}, {"negative", "positive"})
+
+    def test_out_of_range_concept_match_emits_warning_without_score(self):
+        torch.manual_seed(43)
+        q = torch.randn(1, 2, 16, 4)
+        k = torch.randn(1, 2, 5, 4)
+        v = torch.randn(1, 2, 5, 4)
+        with tempfile.TemporaryDirectory() as tmp:
+            jsonl_path = Path(tmp) / "survey.jsonl"
+            override = AnimaConceptSurveyAttentionOverride(SurveyConfig(
+                jsonl_path=str(jsonl_path),
+                capture_level="heatmap",
+                concept_terms="distant",
+                token_text_map={
+                    7: {"token_index": 7, "source_token_index": 7, "token_text": "distant", "token_source": "qwen"},
+                },
+            ))
+            override(
+                reference_attention,
+                q,
+                k,
+                v,
+                2,
+                skip_reshape=True,
+                transformer_options={
+                    "sigmas": torch.tensor([0.5]),
+                    "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
+                },
+            )
+
+            records = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+            observation = next(record for record in records if record.get("event") == "attention_observation")
+            warning = next(
+                record for record in records
+                if record.get("event") == "concept_alignment_warning"
+                and record.get("reason") == "concept_token_index_out_of_range"
+            )
+            self.assertEqual(observation["concept_scores"], [])
+            self.assertEqual(warning["token_indices"], [7])
+            self.assertEqual(warning["text_len"], 5)
+
+    def test_concept_heatmap_math_sums_matched_token_probability_mass(self):
+        attention_probs = torch.tensor([[[[
+            0.10, 0.20, 0.70,
+        ], [
+            0.30, 0.40, 0.30,
+        ], [
+            0.25, 0.50, 0.25,
+        ], [
+            0.60, 0.10, 0.30,
+        ]]]], dtype=torch.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            heatmap_dir = Path(tmp) / "heatmaps"
+            override = AnimaConceptSurveyAttentionOverride(SurveyConfig(
+                capture_level="heatmap",
+                save_heatmaps=True,
+                heatmap_dir=str(heatmap_dir),
+                concept_terms="big breasts",
+                token_text_map={
+                    0: {"token_index": 0, "token_text": "big", "token_source": "qwen"},
+                    2: {"token_index": 2, "token_text": " breasts", "token_source": "qwen"},
+                },
+            ))
+
+            scores = override._concept_scores_from_attention(attention_probs, (2, 2))
+            expected_mass = attention_probs[..., [0, 2]].sum(dim=-1)
+            expected_heatmap = expected_mass.mean(dim=(0, 1)).reshape(2, 2)
+
+            self.assertEqual(len(scores), 1)
+            self.assertTrue(torch.allclose(scores[0]["_heatmap"], expected_heatmap))
+            self.assertTrue(math.isclose(scores[0]["score_mean"], float(expected_mass.mean()), rel_tol=1e-6))
+            self.assertTrue(math.isclose(scores[0]["score_max"], float(expected_mass.max()), rel_tol=1e-6))
+
+            progress = progress_from_sigmas({
+                "sigmas": torch.tensor([0.5]),
+                "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
+            })
+            self.assertIsNotNone(progress)
+            override._save_concept_heatmaps(scores, (2, 2), progress, 0, "positive")
+
+            manifest = json.loads((heatmap_dir / "concepts" / "manifest.json").read_text(encoding="utf-8"))
+            saved = np.load(heatmap_dir / "concepts" / manifest[0]["npy"])
+            self.assertTrue(np.allclose(saved, expected_heatmap.numpy()))
+            self.assertTrue(math.isclose(manifest[0]["heatmap_mean"], float(saved.mean()), rel_tol=1e-6))
+            self.assertTrue(math.isclose(manifest[0]["heatmap_max"], float(saved.max()), rel_tol=1e-6))
 
 
 if __name__ == "__main__":

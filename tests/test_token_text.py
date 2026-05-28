@@ -27,12 +27,16 @@ class TokenTextTests(unittest.TestCase):
         flat = flatten_tokenized({"a": [[(1, 1.0), (2, 0.8)]], "b": [[3]]})
         self.assertEqual([item.token_id for item in flat], [1, 2, 3])
         self.assertEqual([item.token_source for item in flat], ["a", "a", "b"])
+        self.assertEqual([item.token_index for item in flat], [0, 1, 2])
+        self.assertEqual([item.source_token_index for item in flat], [0, 1, 0])
         self.assertEqual(flat[1].weight, 0.8)
 
     def test_build_token_text_map_uses_clip_decoder(self):
         mapping = build_token_text_map(MockClip(), "hello")
         self.assertEqual(mapping[0]["token_text"], "tok_101")
         self.assertEqual(mapping[0]["token_source"], "l")
+        self.assertEqual(mapping[0]["source_token_index"], 0)
+        self.assertEqual(mapping[2]["source_token_index"], 0)
         self.assertEqual(mapping[2]["token_text"], "tok_201")
         self.assertEqual(mapping[1]["weight"], 0.5)
 
