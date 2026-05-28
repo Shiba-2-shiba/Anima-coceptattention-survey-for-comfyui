@@ -9,6 +9,7 @@ import torch
 @dataclass(frozen=True)
 class TokenTextEntry:
     token_index: int
+    source_token_index: int
     token_id: int | None
     token_text: str
     token_source: str
@@ -17,6 +18,7 @@ class TokenTextEntry:
     def to_record(self) -> dict[str, Any]:
         return {
             "token_index": self.token_index,
+            "source_token_index": self.source_token_index,
             "token_id": self.token_id,
             "token_text": self.token_text,
             "token_source": self.token_source,
@@ -48,6 +50,7 @@ def build_token_text_map(clip: Any, prompt_text: str, max_length: int | None = N
             token_text = _fallback_token_text(entry.token_id)
         mapped = TokenTextEntry(
             token_index=entry.token_index,
+            source_token_index=entry.source_token_index,
             token_id=entry.token_id,
             token_text=token_text,
             token_source=entry.token_source,
@@ -60,6 +63,7 @@ def build_token_text_map(clip: Any, prompt_text: str, max_length: int | None = N
 @dataclass(frozen=True)
 class _FlatToken:
     token_index: int
+    source_token_index: int
     token_source: str
     token_id: int | None
     weight: float | None
@@ -76,14 +80,17 @@ def flatten_tokenized(tokenized: Any) -> list[_FlatToken]:
 
 
 def _append_stream(entries: list[_FlatToken], source: str, value: Any) -> None:
+    source_token_index = 0
     for item in _iter_leaf_tokens(value):
         token_id, weight = _parse_token_item(item)
         entries.append(_FlatToken(
             token_index=len(entries),
+            source_token_index=source_token_index,
             token_source=source,
             token_id=token_id,
             weight=weight,
         ))
+        source_token_index += 1
 
 
 def _iter_leaf_tokens(value: Any) -> Iterable[Any]:

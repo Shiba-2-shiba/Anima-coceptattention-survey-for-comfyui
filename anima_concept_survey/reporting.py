@@ -26,6 +26,7 @@ def summarize_records(records: Iterable[dict[str, Any]], top_k: int = 16, late_s
     by_step: dict[int, list[dict[str, Any]]] = defaultdict(list)
     by_branch: dict[str, list[dict[str, Any]]] = defaultdict(list)
     token_rows: dict[tuple[int, str, int], list[dict[str, Any]]] = defaultdict(list)
+    concept_rows: dict[tuple[int, str, str], list[dict[str, Any]]] = defaultdict(list)
 
     for record in observations:
         call = int(record.get("eligible_call_index", -1))
@@ -42,11 +43,21 @@ def summarize_records(records: Iterable[dict[str, Any]], top_k: int = 16, late_s
                 "image_len": record.get("image_len"),
                 "text_len": record.get("text_len"),
             })
+        for concept in record.get("concept_scores") or []:
+            term = str(concept.get("term") or "")
+            concept_rows[(call, branch, term)].append({
+                **concept,
+                "step_index": step,
+                "block": record.get("block", "unknown"),
+                "image_len": record.get("image_len"),
+                "text_len": record.get("text_len"),
+            })
 
     summary_by_call = [_summarize_group({"eligible_call_index": call, "branch": branch}, rows, late_start_step) for (call, branch), rows in sorted(by_call.items())]
     summary_by_step = [_summarize_group({"step_index": step}, rows, late_start_step) for step, rows in sorted(by_step.items())]
     summary_by_branch = [_summarize_group({"branch": branch}, rows, late_start_step) for branch, rows in sorted(by_branch.items())]
     summary_by_token = _summarize_tokens(token_rows, top_k)
+    summary_by_concept = _summarize_concepts(concept_rows)
 
     recommended_targets = [
         {
@@ -73,6 +84,7 @@ def summarize_records(records: Iterable[dict[str, Any]], top_k: int = 16, late_s
         "summary_by_step": summary_by_step,
         "summary_by_branch": summary_by_branch,
         "summary_by_token": summary_by_token,
+        "summary_by_concept": summary_by_concept,
         "recommended_lora_targets": recommended_targets,
     }
 
@@ -86,6 +98,7 @@ def write_summary_outputs(result: dict[str, Any], out_dir: str | Path) -> dict[s
         "by_step_csv": out / "survey_by_step.csv",
         "by_branch_csv": out / "survey_by_branch.csv",
         "by_token_csv": out / "survey_by_token.csv",
+        "by_concept_csv": out / "survey_by_concept.csv",
         "recommended_lora_targets_csv": out / "recommended_lora_targets.csv",
         "report_md": out / "survey_report.md",
     }
@@ -94,6 +107,7 @@ def write_summary_outputs(result: dict[str, Any], out_dir: str | Path) -> dict[s
     _write_csv(paths["by_step_csv"], result["summary_by_step"])
     _write_csv(paths["by_branch_csv"], result["summary_by_branch"])
     _write_csv(paths["by_token_csv"], result["summary_by_token"])
+    _write_csv(paths["by_concept_csv"], result["summary_by_concept"])
     _write_csv(paths["recommended_lora_targets_csv"], result["recommended_lora_targets"])
     paths["report_md"].write_text(_report_markdown(result), encoding="utf-8")
     return {key: str(path) for key, path in paths.items()}
@@ -144,6 +158,28 @@ def _summarize_tokens(token_rows: dict[tuple[int, str, int], list[dict[str, Any]
     return [{**row, "rank": rank} for rank, row in enumerate(rows[:top_k], start=1)]
 
 
+def _summarize_concepts(concept_rows: dict[tuple[int, str, str], list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    rows = []
+    for (call, branch, term), items in concept_rows.items():
+        score_means = [float(item["score_mean"]) for item in items if item.get("score_mean") is not None]
+        score_maxes = [float(item["score_max"]) for item in items if item.get("score_max") is not None]
+        entropies = [float(item["score_entropy"]) for item in items if item.get("score_entropy") is not None]
+        rows.append({
+            "term": term,
+            "branch": branch,
+            "eligible_call_index": call,
+            "observation_count": len(items),
+            "score_mean": _mean(score_means),
+            "score_max": _max(score_maxes),
+            "score_entropy": _mean(entropies),
+            "token_indices": _mode_json(item.get("token_indices") for item in items),
+            "token_texts": _mode_json(item.get("token_texts") for item in items),
+            "token_sources": _mode_json(item.get("token_sources") for item in items),
+        })
+    rows.sort(key=lambda item: item["score_mean"] or 0.0, reverse=True)
+    return rows
+
+
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     fieldnames = sorted({key for row in rows for key in row})
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -178,6 +214,13 @@ def _report_markdown(result: dict[str, Any]) -> str:
             f"| {row['rank']} | {row['eligible_call_index']} | {row['branch']} | {row['token_index']} | {row.get('token_text')} | "
             f"{row['score_mean']} | {row['score_max']} | {row['score_entropy']} |"
         )
+    if result.get("summary_by_concept"):
+        lines.extend(["", "## Concepts", "", "| call | branch | term | mean | max | entropy | tokens |", "| --- | --- | --- | --- | --- | --- | --- |"])
+        for row in result["summary_by_concept"][:20]:
+            lines.append(
+                f"| {row['eligible_call_index']} | {row['branch']} | {row['term']} | "
+                f"{row['score_mean']} | {row['score_max']} | {row['score_entropy']} | {row['token_texts']} |"
+            )
     lines.append("")
     return "\n".join(lines)
 
@@ -200,3 +243,12 @@ def _mode_text(values: Iterable[Any]) -> Any:
     if not counts:
         return None
     return sorted(counts.items(), key=lambda item: (-item[1], str(item[0])))[0][0]
+
+
+def _mode_json(values: Iterable[Any]) -> str | None:
+    encoded = [
+        json.dumps(value, ensure_ascii=False, sort_keys=True)
+        for value in values
+        if value not in (None, "")
+    ]
+    return _mode_text(encoded)
