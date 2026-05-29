@@ -6,38 +6,46 @@ import torch
 
 
 def parse_call_index_scope(spec: str) -> set[int] | None:
+    return _parse_index_scope(spec, label="call")
+
+
+def parse_step_index_scope(spec: str) -> set[int] | None:
+    return _parse_index_scope(spec, label="step")
+
+
+def _parse_index_scope(spec: str, *, label: str) -> set[int] | None:
     normalized = str(spec).strip().lower()
     if normalized == "all":
         return None
     if not normalized:
-        raise ValueError("call index scope must be 'all' or a comma-separated list of non-negative integers/ranges")
+        raise ValueError(f"{label} index scope must be 'all' or a comma-separated list of non-negative integers/ranges")
 
     indices: set[int] = set()
     for raw_part in normalized.split(","):
         part = raw_part.strip()
         if not part:
-            raise ValueError(f"Invalid call index scope entry in {spec!r}")
+            raise ValueError(f"Invalid {label} index scope entry in {spec!r}")
         if "-" in part:
             start_text, _, end_text = part.partition("-")
             if not start_text or not end_text:
-                raise ValueError(f"Invalid call index range: {part!r}")
+                raise ValueError(f"Invalid {label} index range: {part!r}")
             try:
                 start = int(start_text)
                 end = int(end_text)
             except ValueError as exc:
-                raise ValueError(f"Invalid call index range: {part!r}") from exc
+                raise ValueError(f"Invalid {label} index range: {part!r}") from exc
             if start < 0 or end < 0:
-                raise ValueError("call index scope entries must be non-negative")
+                raise ValueError(f"{label} index scope entries must be non-negative")
             if end < start:
-                raise ValueError(f"Invalid descending call index range: {part!r}")
+                raise ValueError(f"Invalid descending {label} index range: {part!r}")
             indices.update(range(start, end + 1))
         else:
             try:
                 index = int(part)
             except ValueError as exc:
-                raise ValueError(f"Invalid call index scope entry: {part!r}") from exc
+                raise ValueError(f"Invalid {label} index scope entry: {part!r}") from exc
             if index < 0:
-                raise ValueError("call index scope entries must be non-negative")
+                raise ValueError(f"{label} index scope entries must be non-negative")
             indices.add(index)
     return indices
 

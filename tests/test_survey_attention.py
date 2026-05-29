@@ -423,6 +423,41 @@ class SurveyAttentionTests(unittest.TestCase):
             manifest = json.loads((heatmap_dir / "concepts" / "aggregate" / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual({row["branch"] for row in manifest}, {"negative", "positive"})
 
+    def test_concept_heatmaps_write_call_level_aggregate_manifest(self):
+        torch.manual_seed(45)
+        q = torch.randn(1, 2, 16, 4)
+        k = torch.randn(1, 2, 5, 4)
+        v = torch.randn(1, 2, 5, 4)
+        with tempfile.TemporaryDirectory() as tmp:
+            jsonl_path = Path(tmp) / "survey.jsonl"
+            heatmap_dir = Path(tmp) / "heatmaps"
+            override = AnimaConceptSurveyAttentionOverride(SurveyConfig(
+                jsonl_path=str(jsonl_path),
+                capture_level="heatmap",
+                save_heatmaps=True,
+                heatmap_dir=str(heatmap_dir),
+                concept_terms="big breasts",
+                token_text_map={
+                    0: {"token_index": 0, "source_token_index": 0, "token_text": "big", "token_source": "qwen"},
+                    1: {"token_index": 1, "source_token_index": 1, "token_text": " breasts", "token_source": "qwen"},
+                },
+            ))
+            base_options = {
+                "sigmas": torch.tensor([0.5]),
+                "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
+            }
+            override(reference_attention, q, k, v, 2, skip_reshape=True, transformer_options=base_options)
+            override(reference_attention, q, k, v, 2, skip_reshape=True, transformer_options=base_options)
+            override.finalize()
+
+            by_call_dir = heatmap_dir / "concepts" / "aggregate_by_call"
+            self.assertTrue((by_call_dir / "manifest.json").exists())
+            manifest = json.loads((by_call_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual({row["eligible_call_index"] for row in manifest}, {0, 1})
+            self.assertTrue(all(row["preview_normalization"] == "per_file_minmax" for row in manifest))
+            self.assertTrue(all((by_call_dir / row["preview_png"]).exists() for row in manifest))
+            self.assertTrue(all(row["concept_uid"] for row in manifest))
+
     def test_out_of_range_concept_match_emits_warning_without_score(self):
         torch.manual_seed(43)
         q = torch.randn(1, 2, 16, 4)

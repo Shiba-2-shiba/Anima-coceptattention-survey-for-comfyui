@@ -254,7 +254,43 @@ class ReportingTests(unittest.TestCase):
             report = Path(tmp) / "survey_report.md"
             self.assertIn("rank_score", concept_targets.read_text(encoding="utf-8").splitlines()[0])
             self.assertIn("heatmap_max_over_mean", by_concept.read_text(encoding="utf-8").splitlines()[0])
-            self.assertIn("Recommended Concept Targets", report.read_text(encoding="utf-8"))
+            report_text = report.read_text(encoding="utf-8")
+            self.assertIn("Recommended Concept Targets", report_text)
+            self.assertIn("attention-only candidate", report_text)
+            self.assertIn("fixed-seed prompt/image differences", report_text)
+
+    def test_survey_report_surfaces_unknown_block_metadata_limit(self):
+        records = [
+            {
+                "event": "attention_observation",
+                "step_index": 0,
+                "eligible_call_index": 9,
+                "branch": "positive",
+                "block": "unknown",
+                "token_scores": [],
+                "concept_scores": [
+                    _concept_score(
+                        concept_uid="bigbreasts__qwen__occ0__tok027-028",
+                        branch="positive",
+                        score_mean=0.004,
+                        heatmap_max_over_mean=1.5,
+                        near_uniform=False,
+                    ),
+                ],
+            },
+        ]
+
+        result = summarize_records(records, top_k=2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = write_summary_outputs(result, tmp)
+            report = Path(paths["report_md"]).read_text(encoding="utf-8")
+            by_concept = (Path(tmp) / "survey_by_concept.csv").read_text(encoding="utf-8")
+
+        self.assertIn("block", by_concept.splitlines()[0])
+        self.assertIn("unknown", by_concept)
+        self.assertIn("Block Metadata", report)
+        self.assertIn("block=unknown", report)
 
     def test_markdown_warns_for_near_uniform_and_weak_focus_previews(self):
         records = [

@@ -141,6 +141,7 @@ def summarize_records(
                 **concept,
                 "step_index": step,
                 "block": record.get("block", "unknown"),
+                "metadata": record.get("metadata"),
                 "image_len": record.get("image_len"),
                 "text_len": record.get("text_len"),
             })
@@ -302,6 +303,8 @@ def _summarize_concepts(concept_rows: dict[tuple[int, str, str], list[dict[str, 
             "source_token_indices": _mode_json(item.get("source_token_indices") for item in items),
             "token_texts": _mode_json(item.get("token_texts") for item in items),
             "token_sources": _mode_json(item.get("token_sources") for item in items),
+            "block": _mode_text(item.get("block") for item in items) or "unknown",
+            "metadata": _mode_json(item.get("metadata") for item in items),
         })
     rows.sort(key=lambda item: item["score_mean"] or 0.0, reverse=True)
     return rows
@@ -339,6 +342,7 @@ def _recommend_concept_targets(summary_by_concept: list[dict[str, Any]]) -> list
             "uniform_baseline": row.get("uniform_baseline"),
             "score_mean_over_uniform": row.get("score_mean_over_uniform"),
             "near_uniform": bool(row.get("near_uniform")),
+            "candidate_type": "attention_only",
             "target_hint": target_hint,
         })
     ranked.sort(key=lambda item: item["rank_score"], reverse=True)
@@ -509,6 +513,8 @@ def _report_markdown(result: dict[str, Any]) -> str:
     lines.extend([
         "## Recommended LoRA Targets",
         "",
+        "These rows are attention-only candidate calls. They are not proof that a prompt token causally created a final-image region.",
+        "",
         "| rank | call | branch | score | late_score |",
         "| --- | --- | --- | --- | --- |",
     ])
@@ -521,6 +527,8 @@ def _report_markdown(result: dict[str, Any]) -> str:
         lines.extend([
             "",
             "## Recommended Concept Targets",
+            "",
+            "These rows are attention-only candidate concepts. Cross-check them with fixed-seed prompt/image differences and intervention runs before using them for LoRA or merge decisions.",
             "",
             "| rank | term | call | branch | rank_score | mean | mean/uniform | focus | warning |",
             "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
@@ -583,6 +591,18 @@ def _report_markdown(result: dict[str, Any]) -> str:
         lines.extend(["", "## Preview Warnings", ""])
         for warning in result["preview_warnings"]:
             lines.append(f"- {warning['message']}")
+    block_values = sorted({str(row.get("block") or "unknown") for row in result.get("summary_by_concept", [])})
+    if block_values:
+        unknown_note = ""
+        if "unknown" in block_values:
+            unknown_note = " block=unknown means this run did not expose a stable transformer block/module path for those observations."
+        lines.extend([
+            "",
+            "## Block Metadata",
+            "",
+            f"- observed concept blocks: {', '.join(block_values)}",
+            f"- note:{unknown_note or ' block/module metadata is preserved when available.'}",
+        ])
     lines.extend(["", "## Top Tokens", "", "| rank | call | branch | token | text | mean | max | entropy |", "| --- | --- | --- | --- | --- | --- | --- | --- |"])
     for row in result["summary_by_token"][:20]:
         lines.append(

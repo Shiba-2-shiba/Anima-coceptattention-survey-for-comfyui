@@ -48,11 +48,17 @@ class ConceptHeatmapAccumulator:
     score_max: float = 0.0
 
 
+@dataclass
+class ConceptCallHeatmapAccumulator(ConceptHeatmapAccumulator):
+    eligible_call_index: int = 0
+
+
 class HeatmapStore:
     def __init__(self, heatmap_dir: str | None):
         self.heatmap_dir = heatmap_dir
         self.token_accumulators: dict[tuple[str, int], HeatmapAccumulator] = {}
         self.concept_accumulators: dict[tuple[str, str], ConceptHeatmapAccumulator] = {}
+        self.concept_call_accumulators: dict[tuple[int, str, str], ConceptCallHeatmapAccumulator] = {}
 
     def save_token_heatmaps(
         self,
@@ -121,6 +127,7 @@ class HeatmapStore:
             save_heatmap_png(out_dir / f"{stem}.png", heatmap)
             save_heatmap_png(out_dir / f"{stem}_preview.png", heatmap, size=(512, 512), color=True)
             self.update_concept_accumulator(branch, concept, heatmap_tensor)
+            self.update_concept_call_accumulator(eligible_call_index, branch, concept, heatmap_tensor)
             manifest_rows.append({
                 "png": f"{stem}.png",
                 "preview_png": f"{stem}_preview.png",
@@ -136,6 +143,7 @@ class HeatmapStore:
             })
         write_heatmap_manifest(out_dir, manifest_rows)
         self.save_aggregate_concept_heatmaps()
+        self.save_aggregate_concept_heatmaps_by_call()
 
     def update_token_accumulator(self, branch: str, token: dict[str, Any], heatmap: torch.Tensor) -> None:
         key = (branch, int(token["token_index"]))
@@ -180,6 +188,31 @@ class HeatmapStore:
                 heatmap_sum=torch.zeros_like(heatmap, dtype=torch.float32),
             )
             self.concept_accumulators[key] = acc
+        acc.heatmap_sum += heatmap.to(torch.float32)
+        acc.count += 1
+        acc.score_sum += float(concept.get("score_mean") or 0.0)
+        acc.score_max = max(acc.score_max, float(concept.get("score_max") or 0.0))
+
+    def update_concept_call_accumulator(self, eligible_call_index: int, branch: str, concept: dict[str, Any], heatmap: torch.Tensor) -> None:
+        key = (int(eligible_call_index), branch, str(concept["concept_uid"]))
+        acc = self.concept_call_accumulators.get(key)
+        if acc is None:
+            acc = ConceptCallHeatmapAccumulator(
+                eligible_call_index=int(eligible_call_index),
+                concept_uid=str(concept["concept_uid"]),
+                term=str(concept["term"]),
+                normalized_term=str(concept.get("normalized_term") or ""),
+                token_source=str(concept.get("token_source") or _first_value(concept.get("token_sources")) or ""),
+                occurrence_index=int(concept.get("occurrence_index") or 0),
+                branch=branch,
+                token_indices=tuple(int(index) for index in concept["token_indices"]),
+                source_token_indices=tuple(int(index) for index in concept.get("source_token_indices", ())),
+                token_texts=tuple(str(text) for text in concept["token_texts"]),
+                token_sources=tuple(str(source) for source in concept["token_sources"]),
+                token_ids=tuple(_optional_int(token_id) for token_id in concept.get("token_ids", ())),
+                heatmap_sum=torch.zeros_like(heatmap, dtype=torch.float32),
+            )
+            self.concept_call_accumulators[key] = acc
         acc.heatmap_sum += heatmap.to(torch.float32)
         acc.count += 1
         acc.score_sum += float(concept.get("score_mean") or 0.0)
@@ -246,6 +279,53 @@ class HeatmapStore:
                 "preview_png": f"{stem}_preview.png",
                 "preview_normalization": PREVIEW_NORMALIZATION,
                 "npy": f"{stem}.npy",
+                "branch": acc.branch,
+                "concept_uid": acc.concept_uid,
+                "term": acc.term,
+                "normalized_term": acc.normalized_term,
+                "token_source": acc.token_source,
+                "occurrence_index": acc.occurrence_index,
+                "token_indices": list(acc.token_indices),
+                "source_token_indices": list(acc.source_token_indices),
+                "token_texts": list(acc.token_texts),
+                "token_sources": list(acc.token_sources),
+                "token_ids": list(acc.token_ids),
+                "observation_count": acc.count,
+                "score_mean": acc.score_sum / acc.count if acc.count else None,
+                "score_max": acc.score_max,
+                **heatmap_stats(heatmap),
+            })
+        (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+
+    def save_aggregate_concept_heatmaps_by_call(self) -> None:
+        import numpy as np
+
+        if not self.concept_call_accumulators:
+            return
+        out_dir = Path(self.heatmap_dir or "") / "concepts" / "aggregate_by_call"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest = []
+        for acc in sorted(self.concept_call_accumulators.values(), key=lambda item: (item.eligible_call_index, item.branch, item.concept_uid)):
+            if acc.count <= 0:
+                continue
+            heatmap = (acc.heatmap_sum / acc.count).numpy()
+            concept_label = concept_filename_label({
+                "concept_uid": acc.concept_uid,
+                "term": acc.term,
+                "token_source": acc.token_source,
+                "occurrence_index": acc.occurrence_index,
+                "token_indices": list(acc.token_indices),
+            })
+            stem = f"call{acc.eligible_call_index:03d}_{acc.branch}_concept_{concept_label}"
+            np.save(out_dir / f"{stem}.npy", heatmap)
+            save_heatmap_png(out_dir / f"{stem}.png", heatmap)
+            save_heatmap_png(out_dir / f"{stem}_preview.png", heatmap, size=(512, 512), color=True)
+            manifest.append({
+                "png": f"{stem}.png",
+                "preview_png": f"{stem}_preview.png",
+                "preview_normalization": PREVIEW_NORMALIZATION,
+                "npy": f"{stem}.npy",
+                "eligible_call_index": acc.eligible_call_index,
                 "branch": acc.branch,
                 "concept_uid": acc.concept_uid,
                 "term": acc.term,
