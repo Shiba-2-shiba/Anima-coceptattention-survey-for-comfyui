@@ -15,6 +15,7 @@ from .records import public_concept_record
 
 LOGGER = logging.getLogger(__name__)
 LOG_PREFIX = "[AnimaConceptSurvey]"
+PREVIEW_NORMALIZATION = "per_file_minmax"
 
 
 @dataclass
@@ -30,12 +31,17 @@ class HeatmapAccumulator:
 
 @dataclass
 class ConceptHeatmapAccumulator:
+    concept_uid: str
     term: str
+    normalized_term: str
+    token_source: str
+    occurrence_index: int
     branch: str
     token_indices: tuple[int, ...]
     source_token_indices: tuple[int, ...]
     token_texts: tuple[str, ...]
     token_sources: tuple[str, ...]
+    token_ids: tuple[int | None, ...]
     heatmap_sum: torch.Tensor
     count: int = 0
     score_sum: float = 0.0
@@ -77,6 +83,7 @@ class HeatmapStore:
             manifest_rows.append({
                 "png": f"{stem}.png",
                 "preview_png": f"{stem}_preview.png",
+                "preview_normalization": PREVIEW_NORMALIZATION,
                 "npy": f"{stem}.npy",
                 "step_index": progress.index,
                 "num_steps": progress.num_steps,
@@ -108,8 +115,8 @@ class HeatmapStore:
         for concept in concept_scores:
             heatmap_tensor = concept["_heatmap"]
             heatmap = heatmap_tensor.numpy()
-            term_label = safe_filename_text(str(concept["term"])) or "concept"
-            stem = f"step{progress.index:03d}_call{eligible_call_index:03d}_{branch}_concept_{term_label}"
+            concept_label = concept_filename_label(concept)
+            stem = f"step{progress.index:03d}_call{eligible_call_index:03d}_{branch}_concept_{concept_label}"
             np.save(out_dir / f"{stem}.npy", heatmap)
             save_heatmap_png(out_dir / f"{stem}.png", heatmap)
             save_heatmap_png(out_dir / f"{stem}_preview.png", heatmap, size=(512, 512), color=True)
@@ -117,6 +124,7 @@ class HeatmapStore:
             manifest_rows.append({
                 "png": f"{stem}.png",
                 "preview_png": f"{stem}_preview.png",
+                "preview_normalization": PREVIEW_NORMALIZATION,
                 "npy": f"{stem}.npy",
                 "step_index": progress.index,
                 "num_steps": progress.num_steps,
@@ -154,16 +162,21 @@ class HeatmapStore:
             acc.score_max = max(acc.score_max, float(score_max))
 
     def update_concept_accumulator(self, branch: str, concept: dict[str, Any], heatmap: torch.Tensor) -> None:
-        key = (branch, str(concept["term"]))
+        key = (branch, str(concept["concept_uid"]))
         acc = self.concept_accumulators.get(key)
         if acc is None:
             acc = ConceptHeatmapAccumulator(
+                concept_uid=str(concept["concept_uid"]),
                 term=str(concept["term"]),
+                normalized_term=str(concept.get("normalized_term") or ""),
+                token_source=str(concept.get("token_source") or _first_value(concept.get("token_sources")) or ""),
+                occurrence_index=int(concept.get("occurrence_index") or 0),
                 branch=branch,
                 token_indices=tuple(int(index) for index in concept["token_indices"]),
                 source_token_indices=tuple(int(index) for index in concept.get("source_token_indices", ())),
                 token_texts=tuple(str(text) for text in concept["token_texts"]),
                 token_sources=tuple(str(source) for source in concept["token_sources"]),
+                token_ids=tuple(_optional_int(token_id) for token_id in concept.get("token_ids", ())),
                 heatmap_sum=torch.zeros_like(heatmap, dtype=torch.float32),
             )
             self.concept_accumulators[key] = acc
@@ -193,6 +206,7 @@ class HeatmapStore:
             manifest.append({
                 "png": f"{stem}.png",
                 "preview_png": f"{stem}_preview.png",
+                "preview_normalization": PREVIEW_NORMALIZATION,
                 "npy": f"{stem}.npy",
                 "branch": acc.branch,
                 "token_index": acc.token_index,
@@ -212,25 +226,37 @@ class HeatmapStore:
         out_dir = Path(self.heatmap_dir or "") / "concepts" / "aggregate"
         out_dir.mkdir(parents=True, exist_ok=True)
         manifest = []
-        for acc in sorted(self.concept_accumulators.values(), key=lambda item: (item.branch, item.term)):
+        for acc in sorted(self.concept_accumulators.values(), key=lambda item: (item.branch, item.concept_uid)):
             if acc.count <= 0:
                 continue
             heatmap = (acc.heatmap_sum / acc.count).numpy()
-            term_label = safe_filename_text(acc.term) or "concept"
-            stem = f"aggregate_{acc.branch}_concept_{term_label}"
+            concept_label = concept_filename_label({
+                "concept_uid": acc.concept_uid,
+                "term": acc.term,
+                "token_source": acc.token_source,
+                "occurrence_index": acc.occurrence_index,
+                "token_indices": list(acc.token_indices),
+            })
+            stem = f"aggregate_{acc.branch}_concept_{concept_label}"
             np.save(out_dir / f"{stem}.npy", heatmap)
             save_heatmap_png(out_dir / f"{stem}.png", heatmap)
             save_heatmap_png(out_dir / f"{stem}_preview.png", heatmap, size=(512, 512), color=True)
             manifest.append({
                 "png": f"{stem}.png",
                 "preview_png": f"{stem}_preview.png",
+                "preview_normalization": PREVIEW_NORMALIZATION,
                 "npy": f"{stem}.npy",
                 "branch": acc.branch,
+                "concept_uid": acc.concept_uid,
                 "term": acc.term,
+                "normalized_term": acc.normalized_term,
+                "token_source": acc.token_source,
+                "occurrence_index": acc.occurrence_index,
                 "token_indices": list(acc.token_indices),
                 "source_token_indices": list(acc.source_token_indices),
                 "token_texts": list(acc.token_texts),
                 "token_sources": list(acc.token_sources),
+                "token_ids": list(acc.token_ids),
                 "observation_count": acc.count,
                 "score_mean": acc.score_sum / acc.count if acc.count else None,
                 "score_max": acc.score_max,
@@ -250,6 +276,37 @@ def safe_filename_text(value: str, max_len: int = 40) -> str:
     value = re.sub(r"\s+", "_", value.strip())
     value = re.sub(r"[^A-Za-z0-9_.-]+", "", value)
     return value[:max_len].strip("._-")
+
+
+def concept_filename_label(concept: dict[str, Any]) -> str:
+    source = safe_filename_text(str(concept.get("token_source") or _first_value(concept.get("token_sources")) or "source"))
+    term = safe_filename_text(str(concept.get("term") or "concept"))
+    occurrence = int(concept.get("occurrence_index") or 0)
+    span = token_span_label(concept.get("token_indices") or ())
+    label = f"{source}_{term}_occ{occurrence}_tok{span}"
+    return safe_filename_text(label, max_len=140) or safe_filename_text(str(concept.get("concept_uid") or "concept"), max_len=140)
+
+
+def token_span_label(indices: Any) -> str:
+    values = [int(index) for index in indices]
+    if not values:
+        return "none"
+    if len(values) == 1:
+        return f"{values[0]:03d}"
+    return f"{values[0]:03d}-{values[-1]:03d}"
+
+
+def _first_value(values: Any) -> Any:
+    if isinstance(values, (list, tuple)) and values:
+        return values[0]
+    return None
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def heatmap_stats(heatmap: Any) -> dict[str, float]:

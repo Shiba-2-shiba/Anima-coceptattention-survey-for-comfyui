@@ -54,19 +54,39 @@ def concept_scores_from_attention(
         concept_attention = attention_probs.index_select(-1, index_tensor).sum(dim=-1)
         heatmap = concept_attention.mean(dim=(0, 1)).reshape(spatial)
         entropy = normalized_entropy(heatmap.flatten(), dim=0)
+        score_mean = float(concept_attention.mean().detach().cpu().item())
+        heatmap_mean = float(heatmap.mean().detach().cpu().item())
+        heatmap_max = float(heatmap.amax().detach().cpu().item())
+        heatmap_std = float(heatmap.std(unbiased=False).detach().cpu().item())
+        heatmap_max_over_mean = heatmap_max / heatmap_mean if heatmap_mean else 0.0
+        uniform_baseline = len(indices) / text_len if text_len else None
+        score_mean_over_uniform = score_mean / uniform_baseline if uniform_baseline else None
         rows.append({
+            "concept_uid": match.concept_uid,
             "term": match.term,
+            "normalized_term": match.normalized_term,
+            "token_source": match.token_source,
             "token_indices": indices,
             "source_token_indices": list(match.source_token_indices),
+            "attention_key_indices": indices,
+            "alignment_strategy": "global_token_index",
+            "alignment_confidence": f"observed_text_len_{text_len}",
             "token_texts": list(match.token_texts),
             "token_sources": [match.token_source for _ in match.token_indices],
             "token_ids": list(match.token_ids),
             "ignored_token_indices": list(match.ignored_token_indices),
             "occurrence_index": match.occurrence_index,
             "match_warnings": list(match.match_warnings),
-            "score_mean": float(concept_attention.mean().detach().cpu().item()),
+            "score_mean": score_mean,
             "score_max": float(concept_attention.amax().detach().cpu().item()),
             "score_entropy": float(entropy.detach().cpu().item()),
+            "heatmap_mean": heatmap_mean,
+            "heatmap_max": heatmap_max,
+            "heatmap_std": heatmap_std,
+            "heatmap_max_over_mean": heatmap_max_over_mean,
+            "uniform_baseline": uniform_baseline,
+            "score_mean_over_uniform": score_mean_over_uniform,
+            "near_uniform": heatmap_max_over_mean < 1.05,
             "_heatmap": heatmap.detach().cpu().to(torch.float32),
         })
     return rows

@@ -1,172 +1,149 @@
-# PROGRESS.md — Codex Refactor Progress
+# PROGRESS.md — Dev Branch Follow-up Refactor Progress
 
-Project: Anima ConceptAttention Survey for ComfyUI  
-Focus: `concept_terms` heatmap correctness and modular refactor
+Project: Anima ConceptAttention Survey for ComfyUI
+Target branch: `dev`
+Focus: make concept survey outputs reliable, run-isolated, and hard to misinterpret
 
 ---
 
 ## Current Status
 
-Status: automated refactor is complete through documentation alignment. The highest-risk `concept_terms` matching path now has source-scoped matching, source-local token indices, explicit diagnostics, out-of-range guards, concept scoring tests, concept-aware reporting, and aligned README/SPEC/TASKS documentation.
+Status: automated implementation is complete through P6 documentation alignment. Manual ComfyUI validation remains.
 
-The current repository already has:
+The current `dev` branch has completed the main modular refactor and the follow-up automated refactor for safer concept survey interpretation:
 
-- ComfyUI V3 node registration.
-- `Anima Concept Survey Model Patch`.
-- observe-only attention override.
-- JSONL attention observation records.
-- token heatmap export.
-- aggregate token heatmaps.
-- `concept_terms` input.
-- phrase/concept heatmaps under `heatmaps/concepts`.
-- aggregate concept heatmaps under `heatmaps/concepts/aggregate`.
-- manifest statistics for saved heatmaps.
-- report scripts.
-- synthetic tests for concept phrase matching and concept heatmap export.
+- duplicate same-span concept matches are removed;
+- append-only JSONL reports are run-filtered by default;
+- concept-specific target recommendations are generated;
+- preview normalization and near-uniform/weak-focus warnings are reported;
+- positive and negative branch interpretation is separated;
+- two run IDs can be compared from JSONL alone.
 
-Main remaining unresolved issue:
+---
 
-- The system still relies on flattened `clip.tokenize(prompt_text)` global token indices matching runtime attention key order. This assumption is now auditable and guarded by runtime `text_len` checks, but still needs manual ComfyUI validation with actual Anima workflows.
+## Evidence from ComfyUI Trials
+
+### Trial 1: concept-only positive branch
+
+Observed configuration:
+
+```text
+run_id=survey-21d49acdd90
+branch_mode=positive_only
+concept_term=big breasts
+token_source=qwen3_06b
+token_indices=[27, 28]
+text_len=512
+attention_observation=560
+concept_score_rows=1120
+token_score_rows=0
+```
+
+Findings:
+
+- Qwen token matching worked.
+- No unmatched concept terms were reported.
+- No concept warnings were reported.
+- The run is a useful baseline for concept-only behavior.
+- Calls `9`, `10`, and `13` looked like first LoRA/slider target candidates.
+- The same token span `[27, 28]` was duplicated as occurrence `0` and occurrence `1`, doubling concept row counts and aggregate observation counts.
+
+### Trial 2: both branches with token heatmaps
+
+Observed configuration:
+
+```text
+run_id=survey-21e5470fe90
+branch_mode=both
+concept_term=big breasts
+token_source=qwen3_06b
+token_indices=[24, 25]
+positive_observations=560
+negative_observations=560
+token_score_rows=17920
+concept_score_rows=2240
+```
+
+Findings:
+
+- Qwen concept matching still worked.
+- Positive concept attention was weaker and more diffuse than Trial 1.
+- Negative concept heatmap was near-uniform.
+- Token heatmaps added a large amount of visual noise for single-concept QA.
+- Per-image min-max preview normalization made weak/near-uniform negative maps look visually louder than the raw values justify.
 
 ---
 
 ## Decisions Carried Forward
 
-### Existing MVP decisions
-
-- Use ComfyUI `optimized_attention_override` for observation.
-- Keep mode observe-only.
-- Do not port full ConceptAttention concept-vector stream yet.
-- Interpret MVP concept heatmaps as summed prompt-token cross-attention, not final-image segmentation.
-- Keep JSONL output even in heatmap mode because image files alone lose token/call/step/branch metadata.
-- Save phrase heatmaps under `heatmaps/concepts`.
-- Use `heatmap_output=concepts_only` for phrase inspection without unrelated top-token heatmaps.
-
-### New refactor decisions
-
-- Treat `concept_terms` correctness as the highest priority.
-- Split monolithic `survey_attention.py` into small modules.
-- Add concept matching data classes.
-- Add source-local token indexing.
-- Add concept diagnostics for unmatched, ambiguous, and out-of-range terms.
-- Do not silently create concept heatmaps for ambiguous source matches.
-- Add `survey_by_concept.csv` to reporting.
-- Keep JSONL schema version 1 and add optional fields rather than breaking existing records.
-
----
-
-## Evidence Already Collected
-
-### Runtime shape evidence
-
-Known Anima/Cosmos cross-attention shape from manual observation:
-
-```text
-q=(2, 16, 4096, 128)
-k=(2, 16, 512, 128)
-v=(2, 16, 512, 128)
-spatial=(64, 64)
-```
-
-This indicates image latent queries attending over 512 text key positions.
-
-### Token text evidence
-
-Manual run with:
-
-```text
-prompt_text="big breasts,"
-```
-
-produced decoded token records similar to:
-
-```text
-token_index=0, token_text="big", token_source="qwen3_06b"
-token_index=1, token_text=" breasts", token_source="qwen3_06b"
-```
-
-This validates the expected `big breasts` unit-test fixture, but more diagnostics are needed for other CLIP/tokenizer variants.
-
-### Test evidence
-
-Existing tests include:
-
-- call-index parser
-- square spatial inference
-- ComfyUI path resolution
-- progress from sigmas
-- branch selection
-- observe-mode passthrough
-- unsupported shape fallback
-- token heatmap export
-- concept phrase matching
-- concept phrase heatmap export
-- report aggregation
+- Keep observe-only behavior.
+- Keep JSONL `schema_version=1` and add optional fields only.
+- Keep `concept_terms` as summed prompt-token attention, not a separate concept-vector stream.
+- Treat `.npy` and manifest/JSONL stats as ground truth.
+- Keep min-max preview PNGs for shape inspection, but warn that they are not comparable by absolute strength.
+- Recommend `branch_mode=positive_only` and `heatmap_output=concepts_only` for initial single-concept localization checks.
+- Reports should be run-isolated by default.
+- Concept target recommendations should be separate from token target recommendations.
 
 ---
 
 ## Known Risks
 
-### R1. Token index alignment risk
+### R1. Duplicate concept matches distort counts
 
-`token_index` from `clip.tokenize(prompt_text)` may not always match runtime `text_key` order.
+The same token span can currently be emitted more than once. This inflates `concept_score_rows` and aggregate observation counts.
 
-Mitigation:
+Mitigation plan:
 
-- Store `source_token_index`.
-- Record token map in run summary.
-- Verify matched token indices are within runtime `text_len`.
-- Emit diagnostics on mismatch.
-- Add manual validation using actual Anima JSONL.
+- Deduplicate by normalized term, token source, global token span, and source-local span.
+- Preserve true repeated phrases only when token spans differ.
 
-### R2. Cross-source false match risk
+### R2. Run mixing distorts reports
 
-The same phrase may decode from multiple tokenizer streams.
+Append-only JSONL files can contain multiple runs.
 
-Mitigation:
+Mitigation plan:
 
-- Match per source.
-- Do not join across sources.
-- Treat multi-source matches as ambiguous unless user supplies `source:term`.
+- Add `--run-id`, `--latest-run`, and `--list-runs`.
+- Refuse silent multi-run aggregation by default.
 
-### R3. Punctuation normalization risk
+### R3. Preview PNGs overstate weak signals
 
-Current normalization can skip punctuation-only tokens, which may unintentionally match across punctuation.
+Min-max normalization is useful for seeing shape but misleading for strength comparisons.
 
-Mitigation:
+Mitigation plan:
 
-- Keep backward-compatible normalization.
-- Record ignored punctuation token indices and warnings.
-- Add tests.
+- Add preview normalization metadata.
+- Add near-uniform warnings.
+- Promote raw heatmap stats in reports.
 
-### R4. Duplicate phrase risk
+### R4. Negative branch maps can be misread
 
-A concept may appear multiple times in the prompt.
+Negative maps may be near-uniform but still look visually colored.
 
-Mitigation:
+Mitigation plan:
 
-- Emit occurrence-indexed matches.
-- Add tests for duplicate occurrences.
+- Separate positive targets from negative diagnostics.
+- Add branch delta CSV.
+- Penalize near-uniform negative maps in concept target ranking.
 
-### R5. Heavy runtime I/O risk
+### R5. Concept-specific ranking is missing
 
-Writing PNG/NPY during sampling may slow generation.
+Token-based target recommendations do not help concept-only runs.
 
-Mitigation:
+Mitigation plan:
 
-- Keep current behavior for MVP.
-- Move expensive rendering to postprocess later if needed.
-- Ensure `concepts_only` avoids top-token heatmap noise.
+- Add `recommended_concept_targets.csv` using concept score and focus metrics.
 
-### R6. Finalize lifecycle risk
+### R6. Runtime attention key alignment remains an audit concern
 
-`finalize()` may not always be called in real ComfyUI runs.
+The Qwen trials indicate current index behavior works for that workflow, but multi-encoder workflows may need a stronger resolver.
 
-Mitigation:
+Mitigation plan:
 
-- Write per-call concept heatmaps immediately as now.
-- Ensure reports can work from attention observations without run summary.
-- Later: design a safer lifecycle hook or report-time aggregation.
+- Preserve and report source-local indices.
+- Add optional `attention_key_indices`, `alignment_strategy`, and `alignment_confidence` when feasible.
+- Keep full resolver as later work unless new validation reveals a mismatch.
 
 ---
 
@@ -176,130 +153,152 @@ Mitigation:
 
 Status: completed
 
-- [x] Create Codex-focused SPEC.md.
-- [x] Create Codex-focused PROGRESS.md.
-- [x] Create Codex-focused TASKS.md.
+- [x] Create follow-up `SPEC.md`.
+- [x] Create follow-up `TASKS.md`.
+- [x] Create follow-up `PROGRESS.md`.
 
-### M1. Characterization Tests
-
-Status: completed
-
-Goal: preserve current behavior before moving code.
-
-- [x] Add tests for current concept heatmap math.
-- [x] Add tests for `concepts_only` output behavior.
-- [x] Add tests for no cross-source matching.
-- [x] Add tests for unmatched concept diagnostics after implementation.
-
-### M2. Module Extraction Without Behavior Change
+### M1. Duplicate Concept Fixes
 
 Status: completed
 
-Goal: split pure helpers from `survey_attention.py` while keeping tests green.
+Goal:
 
-Planned modules:
+- Remove same-span duplicate concept matches.
+- Preserve true repeated phrases.
+- Add stable concept identity.
+- Prevent concept heatmap filename/aggregate/report collisions.
 
-- `config.py` — completed.
-- `paths.py` — completed.
-- `progress.py` — completed.
-- `branches.py` — completed.
-- `selectors.py` — completed.
-- `metadata.py` — completed.
-- `concepts.py` — completed.
-- `scoring.py` — completed.
-- `heatmaps.py` — completed.
-- `records.py` — completed.
-- `writer.py` — completed.
-- `override.py` — completed.
+Planned:
 
-### M3. Concept Matching Rewrite
+- [x] Add duplicate same-span regression tests.
+- [x] Add repeated phrase preservation tests.
+- [x] Implement match dedupe.
+- [x] Add `concept_uid`.
+- [x] Update heatmap accumulator keys and filenames.
+- [x] Update report grouping keys.
 
-Status: completed
-
-Goal: replace current `ConceptTokenGroup` logic with auditable match records.
-
-Required additions:
-
-- `ConceptTermSpec`
-- `ConceptTokenMatch`
-- `ConceptMatchReport`
-- [x] source prefix parsing
-- [x] source-local token indices
-- [x] duplicate occurrence support
-- [x] ambiguity diagnostics
-- [x] ignored punctuation diagnostics
-
-### M4. Concept Heatmap Correctness
+### M2. Run-Filtered Reporting
 
 Status: completed
 
-Goal: prove concept heatmaps equal summed matched-token attention probability mass.
+Goal:
 
-Required work:
+- Make append-only JSONL safe to analyze.
 
-- [x] Extract concept scoring into `scoring.py`.
-- [x] Test deterministic tiny tensors.
-- [x] Test `.npy` raw values.
-- [x] Test manifest statistics.
-- [x] Test branch separation.
+Planned:
 
-### M5. JSONL Diagnostics
+- [x] Add run discovery utilities.
+- [x] Add `--list-runs`.
+- [x] Add `--run-id`.
+- [x] Add `--latest-run`.
+- [x] Add `--allow-mixed-runs`.
+- [x] Generate `survey_runs.csv`.
+- [x] Add run metadata to JSON/Markdown reports.
 
-Status: completed
-
-Goal: make missing or ambiguous concept heatmaps explainable.
-
-Required events:
-
-- [x] `concept_match_summary`
-- [x] `concept_unmatched`
-- [x] `concept_alignment_warning`
-
-### M6. Reporting Extension
+### M3. Concept Metrics and Recommendations
 
 Status: completed
 
-Goal: make report scripts useful for phrase-level analysis.
+Goal:
 
-Implemented output:
+- Make concept-only runs useful for LoRA/slider target selection.
 
-```text
-survey_by_concept.csv
-```
+Planned:
 
-Implemented updates:
+- [x] Add heatmap focus metrics to JSONL concept scores.
+- [x] Add uniform baseline metrics.
+- [x] Extend `survey_by_concept.csv`.
+- [x] Add `recommended_concept_targets.csv`.
+- [x] Add concept target Markdown section.
 
-- [x] include concept score summaries in `survey_summary.json`
-- [x] include concept section in Markdown report
-- [x] do not break reports when `token_scores` are empty
+### M4. Preview Safety
 
-### M7. Manual ComfyUI Validation
+Status: completed
 
-Status: pending
+Goal:
 
-Manual validation checklist:
+- Prevent min-max preview PNGs from being mistaken for absolute-strength maps.
 
-- [ ] Restart ComfyUI after refactor.
-- [ ] Run fixed seed baseline without survey node.
-- [ ] Run fixed seed observe mode with survey node.
-- [ ] Confirm output image does not change.
-- [ ] Use `capture_level=heatmap`.
-- [ ] Use `save_heatmaps=true`.
-- [ ] Use `heatmap_output=concepts_only`.
-- [ ] Use exact `prompt_text` from generation prompt.
-- [ ] Use `concept_terms=big breasts`.
-- [ ] Confirm aggregate concept preview exists.
-- [ ] Confirm JSONL has `concept_match_summary`.
-- [ ] Confirm JSONL has `attention_observation.concept_scores`.
-- [ ] Confirm report script creates `survey_by_concept.csv`.
+Planned:
+
+- [x] Add `preview_normalization` to manifests.
+- [x] Add near-uniform warnings.
+- [x] Document interpretation in README.
+- [ ] Optionally add fixed-scale preview postprocess later.
+
+### M5. Branch Guidance and Delta
+
+Status: completed
+
+Goal:
+
+- Make positive/negative branch behavior clear.
+
+Planned:
+
+- [x] Add `survey_branch_concept_delta.csv`.
+- [x] Add positive concept target section.
+- [x] Add negative concept diagnostic section.
+- [x] Add branch interpretation labels.
+
+### M6. Run Comparison
+
+Status: completed
+
+Goal:
+
+- Make Trial 1 vs Trial 2 style analysis scriptable.
+
+Planned:
+
+- [x] Add `scripts/compare_survey_runs.py`.
+- [x] Add `compare_summary.json`.
+- [x] Add concept delta CSVs.
+- [x] Add Markdown comparison report.
+
+### M7. Documentation Alignment
+
+Status: completed
+
+Goal:
+
+- Align docs with new reporting behavior.
+
+Planned:
+
+- [x] Update README.
+- [x] Update project `SPEC.md`.
+- [x] Update project `TASKS.md`.
+- [x] Update project `PROGRESS.md`.
+
+### M8. Manual Validation
+
+Status: not started
+
+Goal:
+
+- Confirm fixes in ComfyUI.
+
+Planned:
+
+- [ ] Fresh positive-only concept run.
+- [ ] Confirm no duplicate same-span occurrence.
+- [ ] Confirm aggregate counts are not doubled.
+- [ ] Confirm run filtering on append-only JSONL.
+- [ ] Confirm concept recommendation output.
+- [ ] Confirm near-uniform warnings for both-branch run.
 
 ---
 
 ## Current Next Step for Codex
 
-Continue with manual ComfyUI validation when a runtime is available.
+Start with M8 / P7:
 
-Automated tests are green after module extraction and documentation alignment. Manual ComfyUI validation is still pending.
+1. Run a fresh positive-only concept validation in ComfyUI.
+2. Validate run-filtered reporting on an append-only JSONL containing two runs.
+3. Validate concept recommendations and near-uniform warnings on a both-branch run.
+
+P0-P6 are now in place; manual ComfyUI validation remains.
 
 ---
 
@@ -328,15 +327,150 @@ Next:
 
 ## Change Log
 
-### 2026-05-28 — Codex refactor plan created
+### 2026-05-29 — P6 documentation alignment completed
 
 Changed:
 
-- Added Codex-focused planning docs for concept heatmap correctness.
-- Defined stricter meaning of correct `concept_terms` heatmaps.
-- Defined module split plan.
-- Defined diagnostics for unmatched and ambiguous concept terms.
-- Defined concept-aware report requirements.
+- Updated README with recommended concept-only workflow settings, `max_tokens` behavior, run filtering examples, and run comparison examples.
+- Updated SPEC completion status to show automated P0-P6 completion and remaining manual validation.
+- Marked P6 documentation tasks complete in TASKS and PROGRESS.
+
+Tests:
+
+- command: python -m pytest -q
+- result: 43 passed, 7 subtests passed
+
+Next:
+
+- Start M8 / P7 manual ComfyUI validation.
+
+### 2026-05-29 — P5 run comparison reporting completed
+
+Changed:
+
+- Added `scripts/compare_survey_runs.py` for JSONL-only comparison of two run IDs.
+- Added comparison outputs: `compare_summary.json`, `concept_score_delta.csv`, `concept_call_delta.csv`, `branch_delta.csv`, `prompt_token_span_delta.csv`, and `compare_report.md`.
+- Added comparison logic for concept score/focus deltas, call-level deltas, branch deltas, and prompt/token span differences.
+- Added CLI smoke test for comparing a positive-only stronger run against a both-branch weaker/near-uniform run.
+
+Tests:
+
+- command: python -m pytest tests\test_reporting.py -q
+- result: 13 passed
+- command: python -m pytest -q
+- result: 43 passed, 7 subtests passed
+
+Next:
+
+- Start M7 / P6 documentation alignment.
+
+### 2026-05-29 — P4 branch delta reporting completed
+
+Changed:
+
+- Added `survey_branch_concept_delta.csv` comparing positive and negative concept rows by call and concept identity.
+- Added branch interpretation labels: `positive-localized`, `negative-uniform`, `both-diffuse`, and `branch-ambiguous`.
+- Split Markdown into Positive Concept Targets, Negative Concept Diagnostics, and Branch Delta sections.
+- Updated README branch guidance for `positive_only`, `both`, and negative-branch preview interpretation.
+
+Tests:
+
+- command: python -m pytest tests\test_reporting.py -q
+- result: 12 passed
+- command: python -m pytest -q
+- result: 42 passed, 7 subtests passed
+
+Next:
+
+- Start M6 / P5 run comparison reporting.
+
+### 2026-05-29 — P3 preview safety warnings completed
+
+Changed:
+
+- Added `preview_normalization=per_file_minmax` to token, concept, and aggregate heatmap manifests.
+- Added near-uniform and weak-focus preview warnings to report summaries and Markdown reports.
+- Updated README guidance to explain per-file min-max preview normalization and raw-stat interpretation.
+
+Tests:
+
+- command: python -m pytest tests\test_reporting.py tests\test_survey_attention.py -q
+- result: 27 passed, 5 subtests passed
+- command: python -m pytest -q
+- result: 41 passed, 7 subtests passed
+
+Next:
+
+- Start M5 / P4 branch concept delta reporting and branch-specific Markdown sections.
+
+### 2026-05-29 — P2 concept metrics and recommendations completed
+
+Changed:
+
+- Added concept heatmap stats, uniform baseline, mean-over-uniform, attention key indices, and near-uniform flags to JSONL concept scores.
+- Extended `survey_by_concept.csv` with concept identity, source-local indices, heatmap focus metrics, uniform baseline, and near-uniform status.
+- Added `recommended_concept_targets.csv` with the specified heuristic ranking formula.
+- Added a Recommended Concept Targets section to Markdown reports.
+
+Tests:
+
+- command: python -m pytest tests\test_reporting.py tests\test_survey_attention.py -q
+- result: 26 passed, 5 subtests passed
+- command: python -m pytest -q
+- result: 40 passed, 7 subtests passed
+
+Next:
+
+- Start M4 / P3 preview normalization metadata and near-uniform warnings.
+
+### 2026-05-29 — P1 run-filtered reporting completed
+
+Changed:
+
+- Added `RunInfo`, run discovery, latest-run detection, and run-id filtering helpers.
+- Updated `summarize_survey.py` with `--list-runs`, `--run-id`, `--latest-run`, and `--allow-mixed-runs`.
+- Made multi-run JSONL summarization fail by default unless a run filter or explicit mixed-run mode is supplied.
+- Added `survey_runs.csv` plus selected/available run metadata in JSON and Markdown reports.
+
+Tests:
+
+- command: python -m pytest tests\test_reporting.py -q
+- result: 9 passed
+- command: python -m pytest -q
+- result: 39 passed, 7 subtests passed
+
+Next:
+
+- Start M3 / P2 concept heatmap metrics and recommendations.
+
+### 2026-05-29 — P0 concept identity and dedupe completed
+
+Changed:
+
+- Added regression tests for duplicate same-span concept matches and repeated phrase preservation.
+- Added concept match dedupe keyed by normalized term, token source, global token span, and source-local token span.
+- Added stable `concept_uid` to concept matches, JSONL concept scores, concept diagnostics, heatmap manifests, aggregate manifests, and report rows.
+- Updated concept heatmap filenames, aggregate keys, and report grouping to keep distinct concept identities separate.
+
+Tests:
+
+- command: python -m pytest -q
+- result: 34 passed, 7 subtests passed
+
+Next:
+
+- Start M2 / P1 run discovery and run-filtered reporting.
+
+### 2026-05-28 — Follow-up refactor plan created
+
+Changed:
+
+- Added follow-up planning docs based on ComfyUI trial evidence.
+- Prioritized duplicate concept match fix.
+- Defined run-filtered reporting behavior.
+- Defined concept-specific target recommendation output.
+- Defined preview normalization warnings.
+- Defined branch delta and run comparison outputs.
 
 Tests:
 
@@ -344,79 +478,4 @@ Tests:
 
 Next:
 
-- Add characterization tests before refactoring implementation.
-
-### 2026-05-28 — P0-P5/P7 concept correctness pass
-
-Changed:
-
-- Added characterization tests for exact passthrough, `concepts_only` token-file suppression, deterministic concept heatmap math, unmatched diagnostics, and out-of-range concept guards.
-- Extracted pure infrastructure modules: `config.py`, `paths.py`, `progress.py`, `branches.py`, `selectors.py`, and `metadata.py`.
-- Added `source_token_index` to token flattening and token text records.
-- Added `concepts.py` with source-prefixed parsing, source-scoped matching, duplicate occurrence records, ambiguity handling, fallback-token exclusion, and ignored punctuation diagnostics.
-- Replaced runtime concept scoring inputs with `ConceptMatchReport` / `ConceptTokenMatch` while keeping `build_concept_token_groups` as a compatibility wrapper.
-- Added `scoring.py` for token and concept score calculation.
-- Added JSONL `concept_match_summary`, `concept_unmatched`, and `concept_alignment_warning` events.
-- Added concept report aggregation and `survey_by_concept.csv`; reports tolerate empty `token_scores`.
-
-Tests:
-
-- command: python -m pytest -q
-- result: 28 passed, 7 subtests passed
-
-Notes:
-
-- Runtime token-key alignment is now diagnosable and guarded by `text_len`, but still needs manual ComfyUI validation.
-- `heatmaps.py`, `records.py`, `writer.py`, and `override.py` extraction remain.
-
-Next:
-
-- Extract heatmap writing and record/writer helpers without changing behavior.
-
-### 2026-05-28 — Heatmap/record/writer/override extraction
-
-Changed:
-
-- Added `heatmaps.py` with heatmap accumulators, PNG/NPY writing, manifest writing, and aggregate save logic.
-- Added `records.py` helpers for skipped/fallback records, concept diagnostics, public concept filtering, and run summaries.
-- Added `writer.py` with `JsonlWriter`.
-- Moved the runtime observer implementation to `override.py`.
-- Kept `survey_attention.py` as a compatibility export surface for existing imports.
-- Wrapped observer-side computation in `torch.no_grad()`.
-
-Tests:
-
-- command: python -m pytest -q
-- result: 28 passed, 7 subtests passed
-
-Notes:
-
-- `survey_attention.py` is now a re-export layer; new implementation work should target the responsibility-specific modules.
-- Manual ComfyUI validation remains pending.
-
-Next:
-
-- Update README/SPEC to match the final module layout and run manual validation when a ComfyUI runtime is available.
-
-### 2026-05-28 — Documentation alignment and branch coverage
-
-Changed:
-
-- Added an automated concept heatmap branch-separation test for positive and negative branches.
-- Updated README with source-prefixed `concept_terms`, diagnostics, concept heatmap interpretation, `survey_by_concept.csv`, package layout, and manual validation protocol.
-- Updated SPEC to describe the implemented module split and `survey_attention.py` compatibility surface.
-- Updated TASKS/PROGRESS completion states.
-
-Tests:
-
-- command: python -m pytest -q
-- result: 29 passed, 7 subtests passed
-
-Notes:
-
-- Automated refactor work is complete against the local test suite.
-- Manual ComfyUI validation remains the main remaining acceptance item.
-
-Next:
-
-- Run fixed-seed ComfyUI observe invariance and fresh `concept_terms=big breasts` validation.
+- Add duplicate same-span concept match regression tests.

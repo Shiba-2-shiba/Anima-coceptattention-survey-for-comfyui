@@ -51,6 +51,7 @@ def concept_match_summary_record(
         "terms": [term.term for term in parse_concept_terms(concept_terms)],
         "matches": [
             {
+                "concept_uid": match.concept_uid,
                 "term": match.term,
                 "normalized_term": match.normalized_term,
                 "token_source": match.token_source,
@@ -125,6 +126,7 @@ def concept_alignment_warning_record(
         "schema_version": 1,
         "event": "concept_alignment_warning",
         "run_id": run_id,
+        "concept_uid": match.concept_uid,
         "term": match.term,
         "normalized_term": match.normalized_term,
         "token_source": match.token_source,

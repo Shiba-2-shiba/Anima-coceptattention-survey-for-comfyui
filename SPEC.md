@@ -1,845 +1,738 @@
-# SPEC.md — Codex Refactor Specification
+# SPEC.md — Dev Branch Follow-up Refactor Specification
 
-Project: Anima ConceptAttention Survey for ComfyUI  
-Focus: `concept_terms` heatmap correctness, maintainability, and safe refactoring  
-Target reader: Codex or a developer applying incremental patches to the existing repository
+Project: Anima ConceptAttention Survey for ComfyUI
+Branch target: current `dev` branch after the modular refactor
+Primary goal: make `concept_terms` survey outputs reliable, run-isolated, and hard to misinterpret
+
+Implementation status as of 2026-05-29:
+
+- Automated implementation is complete for duplicate concept dedupe, stable concept identity, run-filtered reporting, concept target ranking, preview warnings, branch delta reporting, and JSONL-only run comparison.
+- Automated validation passes with `python -m pytest -q`.
+- Fresh ComfyUI manual validation is still pending and remains the final validation step.
 
 ---
 
-## 0. Primary Objective
+## 1. Background
 
-Refactor the current MVP without changing its observe-only behavior, while making `concept_terms` phrase heatmaps reliable, auditable, and testable.
+The current `dev` branch has moved beyond the first MVP. It already supports:
 
-The most important user-facing output is:
+- observe-only Anima/Cosmos cross-attention inspection through `optimized_attention_override`;
+- modularized survey implementation;
+- source-scoped `concept_terms` matching;
+- phrase/concept heatmaps under `heatmaps/concepts`;
+- concept match diagnostics;
+- concept-aware reporting output such as `survey_by_concept.csv`.
+
+Two local ComfyUI trials were run against a Qwen-based Anima workflow. Both trials resolved `big breasts` against the `qwen3_06b` stream and emitted concept heatmaps.
+
+Trial 1 was a clean concept-only positive-branch run:
 
 ```text
-heatmaps/concepts/aggregate/aggregate_<branch>_concept_<term>_preview.png
-heatmaps/concepts/aggregate/manifest.json
-JSONL attention_observation[].concept_scores
+run_id=survey-21d49acdd90
+branch_mode=positive_only
+concept_term=big breasts
+token_source=qwen3_06b
+token_indices=[27, 28]
+text_len=512
+attention_observation=560
+concept_score_rows=1120
+token_score_rows=0
 ```
 
-A correct `concept_terms` heatmap means:
+Trial 1 produced useful concept-target candidates. Calls `9`, `10`, and `13` were the first candidates for LoRA/slider target exploration.
 
-1. The requested human phrase is matched to the intended prompt-token key positions.
-2. The matched token positions are source-scoped and never silently joined across tokenizer streams.
-3. The concept attention map is computed as summed attention probability mass over the matched token positions.
-4. Raw `.npy` values and manifest statistics are based on the un-normalized latent-grid attention values.
-5. PNG normalization is display-only and does not alter score calculations.
-6. If the phrase cannot be matched or alignment is ambiguous, the system records an explicit diagnostic instead of silently producing a misleading heatmap.
+Trial 2 used both branches and saved token heatmaps as well as concept heatmaps:
+
+```text
+run_id=survey-21e5470fe90
+branch_mode=both
+concept_term=big breasts
+token_source=qwen3_06b
+token_indices=[24, 25]
+positive_observations=560
+negative_observations=560
+token_score_rows=17920
+concept_score_rows=2240
+```
+
+Trial 2 demonstrated that token heatmaps are noisy for single-concept QA, and that negative-branch preview PNGs can look visually strong even when raw heatmap values are nearly uniform.
+
+This follow-up refactor focuses on making the generated data safer to interpret, not on producing more heatmaps.
 
 ---
 
-## 1. Non-Negotiable Invariants
+## 2. Non-negotiable Constraints
 
-### 1.1 Observe-only invariant
+### 2.1 Observe-only behavior
 
-The survey node must never edit model attention.
+The survey node must never change generated output.
 
-For every attention call:
+- `AnimaConceptSurveyAttentionOverride.__call__()` must continue to return exactly the original attention backend output.
+- Any observer failure must fallback to the original backend unless `fail_mode=raise`.
+- Existing observe passthrough tests must continue to pass.
+
+### 2.2 JSONL compatibility
+
+Keep `schema_version = 1`.
+
+Allowed:
+
+- add optional fields;
+- add optional JSONL events;
+- add new CSV/Markdown outputs.
+
+Avoid:
+
+- deleting existing fields;
+- changing existing field meanings;
+- requiring old logs to contain new fields.
+
+### 2.3 Public node stability
+
+Do not remove public node inputs.
+
+Allowed:
+
+- add advanced inputs only if clearly useful;
+- improve tooltips;
+- change documentation defaults/recommendations.
+
+### 2.4 Raw arrays are ground truth
+
+Preview PNGs are display aids only.
+
+- `.npy` heatmaps and manifest/JSONL stats are the truth for comparisons.
+- Per-image min-max preview normalization must be documented and reported as potentially misleading.
+
+### 2.5 Concept heatmap definition remains unchanged
+
+For matched concept token indices, the concept heatmap is:
 
 ```python
-return original_func(*args, **kwargs)
+concept_mass = attention_probs[..., attention_key_indices].sum(dim=-1)
+concept_heatmap = concept_mass.mean(dim=(0, 1)).reshape(spatial)
 ```
 
-must remain the final returned value. The observer may inspect tensors, write JSONL, and save files, but it must not modify `q`, `k`, `v`, `kwargs`, or the returned attention output.
-
-Acceptance test:
-
-- Existing exact passthrough test still passes.
-- Add a test where the original attention backend returns a sentinel tensor; the override must return exactly that tensor.
-
-### 1.2 Fail-safe invariant
-
-When the observer cannot prove the concept heatmap is meaningful, it must not create a misleading concept heatmap.
-
-Use one of these explicit outcomes:
-
-- `attention_observation` with valid `concept_scores`
-- `concept_unmatched` diagnostic event
-- `concept_alignment_warning` diagnostic event
-- `attention_fallback` for unsupported attention shapes/signatures
-
-### 1.3 Backward-compatible public node invariant
-
-Do not remove existing public inputs:
-
-- `model`
-- `clip`
-- `mode`
-- `capture_level`
-- `prompt_text`
-- `concept_terms`
-- `target_call_indices`
-- `diagnostic_call_indices`
-- `branch_mode`
-- `max_tokens`
-- `max_steps`
-- `jsonl_path`
-- `save_heatmaps`
-- `heatmap_dir`
-- `heatmap_output`
-- `max_logits_mib`
-- `fail_mode`
-
-Changing defaults requires an explicit update to this spec and README.
-
-### 1.4 Schema compatibility invariant
-
-Keep JSONL `schema_version = 1` unless a breaking schema change is introduced.
-
-Add optional fields rather than removing or renaming existing fields.
+This is prompt-token cross-attention mass. It is not a final-image segmentation mask and not a separate ConceptAttention concept-vector stream.
 
 ---
 
-## 2. Current MVP Summary
+## 3. Problems Addressed by This Refactor
 
-The repository currently implements:
+### Problem A: duplicate concept occurrence records
 
-- ComfyUI V3 node `Anima Concept Survey Model Patch`
-- `optimized_attention_override` observer
-- JSONL records for attention observations, skipped calls, fallback calls, and run summary
-- token text recovery from connected `CLIP` and `prompt_text`
-- top-token heatmaps
-- `concept_terms` phrase heatmaps
-- concept aggregate heatmaps
-- report scripts and CSV/Markdown summary outputs
-- synthetic unit tests for phrase matching and concept heatmap export
+Observed issue:
 
-The current risk is not that the feature is absent. The historical risk was that correctness depended on a monolithic `survey_attention.py` implementation and a weak assumption that flattened `clip.tokenize(prompt_text)` order is identical to runtime attention key order.
+- Trial 1 emitted the same Qwen token span `[27, 28]` as occurrence `0` and occurrence `1`.
+- The duplicated rows had the same token span and same scores.
+- This doubled concept row counts and aggregate observation counts.
 
-The refactor now makes that assumption explicit, testable, and diagnosable through source-scoped matching, `source_token_index`, JSONL diagnostics, and runtime `text_len` guards. Manual ComfyUI validation is still required for real Anima workflows.
+Implemented behavior:
+
+- Deduplicate matches that resolve to the exact same token span.
+- Preserve true repeated phrase occurrences only when they map to distinct token spans.
+
+### Problem B: JSONL run mixing
+
+`survey.jsonl` is append-only. If multiple runs are written to the same file, the current report can aggregate all runs together.
+
+Implemented behavior:
+
+- Add run discovery and run filtering.
+- Do not silently mix multiple `run_id`s by default.
+
+### Problem C: concept-specific target ranking is missing
+
+`recommended_lora_targets.csv` is token-score oriented. It is not useful for concept-only runs where `token_scores` may be empty.
+
+Implemented behavior:
+
+- Add `recommended_concept_targets.csv`.
+- Rank by concept score and heatmap focus metrics.
+
+### Problem D: preview PNGs can overstate weak signals
+
+Current previews normalize each heatmap independently by min/max. Near-uniform negative maps can therefore look visually dramatic.
+
+Implemented behavior:
+
+- Record preview normalization metadata.
+- Add near-uniform warnings in manifests/reports.
+- Prefer absolute stats for interpretation.
+
+### Problem E: branch interpretation is under-specified
+
+Negative branch maps can be useful diagnostics, but are often not meaningful localization maps.
+
+Implemented behavior:
+
+- Separate positive/negative concept sections in reports.
+- Add branch-delta outputs.
+- Recommend `positive_only` for single-concept localization runs.
+
+### Problem F: run comparison is manual
+
+Trial 1 vs Trial 2 differences are useful but currently require manual analysis.
+
+Implemented behavior:
+
+- Add comparison script or report mode for two run IDs.
 
 ---
 
-## 3. Definition of Correct `concept_terms` Behavior
+## 4. Required Data Model Additions
 
-### 3.1 Input parsing
+### 4.1 Concept match dedupe key
 
-`concept_terms` accepts one or more terms separated by newlines, semicolons, or commas.
+Concept matching must deduplicate identical spans using a key equivalent to:
 
-Examples:
-
-```text
-big breasts
-red hair; blue eyes
-qwen3_06b:big breasts
-```
-
-Required parsing behavior:
-
-- Trim surrounding whitespace.
-- Remove empty entries.
-- Deduplicate by normalized `(source_filter, normalized_term)` pair.
-- Preserve the original display text in records and filenames.
-- Support optional source prefix syntax:
-
-```text
-<token_source>:<term>
-```
-
-Examples:
-
-```text
-qwen3_06b:big breasts
-clip_l:red hair
-```
-
-If no source prefix is supplied, the matcher searches each token source independently and chooses only unambiguous matches.
-
-### 3.2 Token map semantics
-
-Token text records must include enough information to audit matching.
-
-Required token record fields:
-
-```json
-{
-  "token_index": 0,
-  "source_token_index": 0,
-  "token_id": 123,
-  "token_text": "big",
-  "token_source": "qwen3_06b",
-  "weight": 1.0
-}
-```
-
-Definitions:
-
-- `token_index`: global flattened prompt-token index, intended to correspond to runtime attention key index.
-- `source_token_index`: token index within a tokenizer stream.
-- `token_source`: tokenizer/encoder stream name, such as `qwen3_06b`, `t5xxl`, `clip_l`, `l`, or `tokens`.
-- `token_text`: decoded token text or fallback placeholder.
-
-If `source_token_index` is not available from the existing token flattening logic, assign it deterministically while flattening each source stream.
-
-### 3.3 Source-scoped phrase matching
-
-A concept phrase must match a contiguous or explicitly tolerated sequence within one token source.
-
-The matcher must never combine tokens from different `token_source` values to form one concept.
-
-For this token map:
-
-```json
-[
-  {"token_index": 0, "source_token_index": 0, "token_text": "big", "token_source": "qwen"},
-  {"token_index": 1, "source_token_index": 1, "token_text": " breasts", "token_source": "qwen"},
-  {"token_index": 2, "source_token_index": 0, "token_text": "big", "token_source": "clip_l"}
+```python
+ConceptSpanKey = tuple[
+    str,          # normalized_term
+    str,          # token_source
+    tuple[int],   # token_indices
+    tuple[int],   # source_token_indices
 ]
 ```
 
-`big breasts` may match indices `[0, 1]`; it must not match `[2, 1]`.
+Optional additions to the key are acceptable if stable:
 
-### 3.4 Normalization
+- `token_ids`
+- `source_filter`
 
-Use a single shared normalization function for both terms and token text.
+Do not dedupe distinct token spans. Repeated text in the prompt should still produce separate matches if it resolves to different token indices.
 
-Normalization should:
+### 4.2 Stable concept identity
 
-- Lowercase.
-- Treat common tokenizer word-start markers as spaces: `▁`, `Ġ`.
-- Remove whitespace for phrase comparison.
-- Remove punctuation for backward compatibility, but record ignored punctuation tokens when they appear inside a match.
-- Preserve original `token_texts` in emitted records.
+Every concept score and concept heatmap should expose a stable identity.
 
-Recommended normalization:
+Required public fields:
 
-```python
-normalize_for_match(" breasts") -> "breasts"
-normalize_for_match("big breasts") -> "bigbreasts"
-normalize_for_match("▁big") -> "big"
-normalize_for_match(",") -> ""
+```json
+{
+  "concept_uid": "big_breasts__qwen3_06b__occ0__tok027-028",
+  "term": "big breasts",
+  "normalized_term": "bigbreasts",
+  "token_source": "qwen3_06b",
+  "occurrence_index": 0,
+  "token_indices": [27, 28],
+  "source_token_indices": [27, 28],
+  "token_texts": [" big", " breasts"],
+  "token_ids": [123, 456]
+}
 ```
 
-Important diagnostic rule:
+`concept_uid` does not need to be exactly this string, but it must be:
 
-- If punctuation-only or special tokens are skipped inside a match, include `ignored_token_indices` and `match_warnings` in the concept match record.
+- stable within a run;
+- filename-safe or convertible to a filename-safe slug;
+- unique across same-term duplicate/source-specific matches;
+- included in JSONL concept scores, heatmap manifests, aggregate manifests, and report rows.
 
-### 3.5 Duplicate occurrences
+### 4.3 Attention key indices
 
-If the same concept phrase appears more than once in the same source, do not silently choose the first match.
+The current Qwen trials show that using token indices works for the tested workflow. However, keep the design ready for multi-source encoders.
 
-Required behavior:
+Add optional fields when feasible:
 
-- Emit one match object per occurrence.
-- Each occurrence has `occurrence_index` starting at 0.
-- The aggregate concept heatmap for the term may sum all occurrences, but the manifest must list the individual occurrence token indices.
+```json
+{
+  "attention_key_indices": [27, 28],
+  "alignment_strategy": "global_token_index",
+  "alignment_confidence": "observed_qwen_text_len_512"
+}
+```
+
+Minimum acceptable behavior for this follow-up refactor:
+
+- preserve `source_token_indices`;
+- use current `token_indices` behavior unless a safer resolver is implemented;
+- include enough metadata to audit the mapping.
+
+Preferred future resolver:
+
+```text
+if text_len == len(token_text_map):
+    use global token_indices
+elif text_len == count(tokens in token_source):
+    use source_token_indices
+elif known source offsets can explain text_len:
+    use source_offset + source_token_indices
+else:
+    emit concept_alignment_warning and skip heatmap
+```
+
+### 4.4 Concept heatmap statistics in JSONL
+
+For concept targets, the report should not have to read PNG/NPY manifests. Add heatmap stats directly to `attention_observation.concept_scores`.
+
+Required fields:
+
+```json
+{
+  "heatmap_mean": 0.0027,
+  "heatmap_max": 0.0164,
+  "heatmap_std": 0.0008,
+  "heatmap_max_over_mean": 2.41,
+  "uniform_baseline": 0.00390625,
+  "score_mean_over_uniform": 0.69,
+  "near_uniform": false
+}
+```
+
+Notes:
+
+- `heatmap_mean` should usually equal or nearly equal `score_mean`.
+- `heatmap_max` is max over the averaged spatial heatmap.
+- `score_max` remains max over raw concept attention mass before batch/head averaging.
+- `uniform_baseline = len(attention_key_indices or token_indices) / text_len`.
+
+---
+
+## 5. Heatmap Output Requirements
+
+### 5.1 Concept file names
+
+Concept heatmap file names must avoid collisions for duplicate/source-specific terms.
+
+Recommended stem:
+
+```text
+step{step:03d}_call{call:03d}_{branch}_concept_{source}_{term}_occ{occ}_tok{span}
+```
 
 Example:
 
-Prompt tokens:
-
 ```text
-big breasts, small breasts
+step004_call009_positive_concept_qwen3_06b_big_breasts_occ0_tok027-028.npy
 ```
 
-`concept_terms=breasts` should produce two occurrence records if both occurrences match.
+Aggregate example:
 
-### 3.6 Ambiguity policy
+```text
+aggregate_positive_concept_qwen3_06b_big_breasts_occ0_tok027-028_preview.png
+```
 
-If no source prefix is specified and the same term matches multiple token sources, the matcher must mark the result as ambiguous.
+### 5.2 Concept accumulator key
+
+Do not aggregate concepts by `(branch, term)` only.
+
+Required key should include at least:
+
+```python
+(
+    branch,
+    concept_uid,
+)
+```
+
+or equivalent:
+
+```python
+(
+    branch,
+    normalized_term,
+    token_source,
+    occurrence_index,
+    tuple(token_indices),
+)
+```
+
+### 5.3 Manifest fields
+
+Each concept manifest row should include:
+
+```json
+{
+  "concept_uid": "...",
+  "term": "big breasts",
+  "normalized_term": "bigbreasts",
+  "token_source": "qwen3_06b",
+  "occurrence_index": 0,
+  "token_indices": [27, 28],
+  "source_token_indices": [27, 28],
+  "attention_key_indices": [27, 28],
+  "token_texts": [" big", " breasts"],
+  "branch": "positive",
+  "eligible_call_index": 9,
+  "step_index": 4,
+  "preview_normalization": "per_file_minmax",
+  "heatmap_mean": 0.0027,
+  "heatmap_max": 0.0164,
+  "heatmap_std": 0.0008,
+  "heatmap_max_over_mean": 2.41,
+  "uniform_baseline": 0.00390625,
+  "score_mean_over_uniform": 0.69,
+  "near_uniform": false
+}
+```
+
+---
+
+## 6. Reporting Requirements
+
+### 6.1 Run discovery and filtering
+
+Add utility functions:
+
+```python
+list_runs(records) -> list[RunInfo]
+filter_records_by_run_id(records, run_id) -> list[dict]
+latest_run_id(records) -> str | None
+```
+
+`RunInfo` should include:
+
+```json
+{
+  "run_id": "survey-...",
+  "first_record_index": 0,
+  "last_record_index": 1234,
+  "events": {"attention_observation": 560},
+  "prompt_text": "...",
+  "branches": ["positive"],
+  "concept_terms": ["big breasts"],
+  "observation_count": 560
+}
+```
+
+### 6.2 CLI behavior
+
+Update `scripts/summarize_survey.py`:
+
+```powershell
+python scripts\summarize_survey.py survey.jsonl --out-dir report --run-id survey-21d49acdd90
+python scripts\summarize_survey.py survey.jsonl --out-dir report --latest-run
+python scripts\summarize_survey.py survey.jsonl --list-runs
+python scripts\summarize_survey.py survey.jsonl --out-dir report --allow-mixed-runs
+```
 
 Default behavior:
 
-- Do not create a concept heatmap for ambiguous matches.
-- Emit `concept_alignment_warning` or `concept_unmatched` with enough detail to explain the ambiguity.
+- If exactly one `run_id` exists, summarize it.
+- If multiple `run_id`s exist and no run filter is supplied, fail with a clear message listing available run IDs.
+- `--allow-mixed-runs` is required to intentionally aggregate multiple runs.
 
-Optional later behavior:
+### 6.3 Report outputs
 
-- Add a UI input for ambiguity handling.
-- For now, use explicit source prefix to resolve ambiguity.
-
-### 3.7 Runtime attention-key alignment
-
-The core risk is token index alignment.
-
-The system must verify the following before emitting concept heatmaps:
+Existing outputs remain:
 
 ```text
-max(matched token_index) < text_len from attention call
+survey_summary.json
+survey_by_call.csv
+survey_by_step.csv
+survey_by_branch.csv
+survey_by_token.csv
+survey_by_concept.csv
+recommended_lora_targets.csv
+survey_report.md
 ```
 
-If this fails:
-
-- Do not emit the concept score for that call.
-- Emit diagnostic reason `concept_token_index_out_of_range`.
-
-Also record these fields in run summary or diagnostics:
-
-```json
-{
-  "token_text_count": 512,
-  "attention_text_len_seen": [512],
-  "concept_match_count": 1,
-  "concept_unmatched_terms": [],
-  "concept_ambiguous_terms": []
-}
-```
-
-If `token_text_count != text_len`, this is not automatically fatal because some decoders may not expose every runtime token. However, concept matches are valid only if all matched token indices are in range.
-
-### 3.8 Heatmap math
-
-Given selected cross-attention probabilities:
+Add:
 
 ```text
-attention_probs shape = [selected_batch, heads, image_query, text_key]
+survey_runs.csv
+recommended_concept_targets.csv
+survey_branch_concept_delta.csv
 ```
 
-For one concept match with token indices `I`:
+Optional later:
+
+```text
+survey_preview_warnings.csv
+```
+
+### 6.4 Concept target ranking
+
+`recommended_concept_targets.csv` should rank concept-specific call targets.
+
+Required columns:
+
+```text
+rank
+rank_score
+term
+concept_uid
+token_source
+occurrence_index
+branch
+eligible_call_index
+observation_count
+score_mean
+score_max
+score_entropy
+heatmap_mean
+heatmap_max
+heatmap_std
+heatmap_max_over_mean
+uniform_baseline
+score_mean_over_uniform
+near_uniform
+target_hint
+```
+
+Initial ranking formula:
 
 ```python
-concept_mass = attention_probs.index_select(dim=-1, indices=I).sum(dim=-1)
-concept_heatmap = concept_mass.mean(dim=(0, 1)).reshape(spatial)
-score_mean = concept_mass.mean()
-score_max = concept_mass.max()
-score_entropy = normalized_entropy(concept_heatmap.flatten())
+uniform_baseline = token_count / text_len
+mean_over_uniform = score_mean / uniform_baseline if uniform_baseline else None
+focus_factor = max(0.0, heatmap_max_over_mean - 1.0)
+focus_factor = min(focus_factor, 4.0)
+near_uniform_penalty = 0.25 if heatmap_max_over_mean < 1.05 else 1.0
+branch_factor = 1.0 if branch == "positive" else 0.5
+rank_score = mean_over_uniform * (1.0 + focus_factor) * near_uniform_penalty * branch_factor
 ```
 
-This is the intended MVP behavior.
+This formula is intentionally simple. It should be documented as a heuristic, not a scientific metric.
 
-Interpretation:
+### 6.5 Near-uniform warning
 
-- The heatmap is the probability mass assigned to the phrase tokens at each latent image query position.
-- It is not a final-image segmentation mask.
-- It is not a separate ConceptAttention concept-vector stream.
-- It is phrase-token attention over the already-tokenized `prompt_text`.
+A concept heatmap is near-uniform when:
 
-### 3.9 Branch handling
+```python
+heatmap_max_over_mean < 1.05
+```
 
-Concept heatmaps must respect `branch_mode` exactly like token heatmaps.
+Weak focus warning:
 
-Expected behavior:
+```python
+1.05 <= heatmap_max_over_mean < 1.15
+```
 
-- `branch_mode=both`: produce positive and negative branch records when `cond_or_uncond` exposes both.
-- `positive_only`: produce only positive branch records.
-- `negative_only`: produce only negative branch records.
-- If branch layout is unavailable and branch-specific mode is requested, fallback/diagnostic must explain this.
-
-### 3.10 Output files
-
-For `capture_level=heatmap`, `save_heatmaps=true`, and `heatmap_output=concepts_only`, concept output must be saved under:
+Markdown report should include warnings such as:
 
 ```text
-<heatmap_dir>/concepts/
-<heatmap_dir>/concepts/aggregate/
+Warning: negative / big breasts / call 13 is near-uniform.
+Preview PNG is min-max normalized and may overstate localization.
+Use raw .npy and heatmap_max_over_mean for interpretation.
 ```
 
-Per-call concept files:
+### 6.6 Branch delta output
+
+Add `survey_branch_concept_delta.csv` grouped by:
 
 ```text
-concepts/step{step:03d}_call{call:03d}_{branch}_concept_{safe_term}.npy
-concepts/step{step:03d}_call{call:03d}_{branch}_concept_{safe_term}.png
-concepts/step{step:03d}_call{call:03d}_{branch}_concept_{safe_term}_preview.png
-concepts/manifest.json
+term
+concept_uid or term/token_source/occurrence/token span
+eligible_call_index
 ```
 
-Aggregate concept files:
+Columns:
 
 ```text
-concepts/aggregate/aggregate_{branch}_concept_{safe_term}.npy
-concepts/aggregate/aggregate_{branch}_concept_{safe_term}.png
-concepts/aggregate/aggregate_{branch}_concept_{safe_term}_preview.png
-concepts/aggregate/manifest.json
+term
+concept_uid
+eligible_call_index
+positive_score_mean
+negative_score_mean
+positive_heatmap_max_over_mean
+negative_heatmap_max_over_mean
+pos_minus_neg_mean
+pos_focus_minus_neg_focus
+interpretation
 ```
 
-Raw `.npy` values must be the unnormalized concept heatmap. PNGs may be normalized for display.
+Interpretation rules:
 
-### 3.11 Manifest requirements
-
-`concepts/manifest.json` rows must include:
-
-```json
-{
-  "term": "big breasts",
-  "normalized_term": "bigbreasts",
-  "branch": "positive",
-  "step_index": 0,
-  "num_steps": 24,
-  "eligible_call_index": 7,
-  "spatial": [64, 64],
-  "token_indices": [0, 1],
-  "source_token_indices": [0, 1],
-  "token_texts": ["big", " breasts"],
-  "token_sources": ["qwen3_06b", "qwen3_06b"],
-  "ignored_token_indices": [],
-  "occurrence_index": 0,
-  "score_mean": 0.01,
-  "score_max": 0.08,
-  "score_entropy": 0.75,
-  "heatmap_mean": 0.01,
-  "heatmap_max": 0.08,
-  "heatmap_std": 0.02,
-  "heatmap_max_over_mean": 8.0,
-  "npy": "...",
-  "png": "...",
-  "preview_png": "..."
-}
-```
-
-Aggregate manifest rows must include:
-
-```json
-{
-  "term": "big breasts",
-  "branch": "positive",
-  "observation_count": 48,
-  "match_count": 1,
-  "matches": [
-    {
-      "occurrence_index": 0,
-      "token_indices": [0, 1],
-      "token_texts": ["big", " breasts"],
-      "token_sources": ["qwen3_06b", "qwen3_06b"]
-    }
-  ],
-  "score_mean": 0.01,
-  "score_max": 0.08,
-  "heatmap_mean": 0.01,
-  "heatmap_max": 0.08,
-  "heatmap_std": 0.02,
-  "heatmap_max_over_mean": 8.0,
-  "npy": "...",
-  "png": "...",
-  "preview_png": "..."
-}
+```text
+positive-localized: positive focus >= 1.15 and positive mean > negative mean
+negative-uniform: negative focus < 1.05
+both-diffuse: both focus < 1.15
+branch-ambiguous: otherwise
 ```
 
 ---
 
-## 4. Refactored Architecture
+## 7. Comparison Report Requirements
 
-The monolithic `survey_attention.py` has been split by responsibility. `survey_attention.py` remains as a backward-compatible re-export layer for existing imports; new implementation work should target the responsibility-specific modules below.
+Add a new script:
 
-Target package layout:
+```powershell
+python scripts\compare_survey_runs.py survey.jsonl ^
+  --run-a survey-21d49acdd90 ^
+  --run-b survey-21e5470fe90 ^
+  --out-dir compare_big_breasts
+```
+
+Outputs:
 
 ```text
-anima_concept_survey/
-  __init__.py
-  config.py
-  paths.py
-  progress.py
-  branches.py
-  selectors.py
-  metadata.py
-  token_text.py
-  concepts.py
-  scoring.py
-  heatmaps.py
-  records.py
-  writer.py
-  override.py
-  survey_attention.py  # compatibility re-export surface
-  reporting.py
-scripts/
-  parse_survey_log.py
-  summarize_survey.py
-nodes.py
+compare_summary.json
+concept_score_delta.csv
+concept_call_delta.csv
+branch_delta.csv
+prompt_token_span_delta.csv
+compare_report.md
 ```
 
-### 4.1 `config.py`
+Minimum useful comparison:
 
-Owns:
+- concept mean delta;
+- concept focus delta;
+- top call changes;
+- branch mode differences;
+- token span/source differences;
+- prompt summary differences.
 
-- constants: modes, capture levels, branch modes, fail modes, heatmap outputs
-- `SurveyConfig`
-- validation
-
-No torch-heavy logic.
-
-### 4.2 `paths.py`
-
-Owns:
-
-- ComfyUI output directory detection
-- relative/absolute path resolution
-- default JSONL and heatmap paths
-
-### 4.3 `progress.py`
-
-Owns:
-
-- `ProgressInfo`
-- `progress_from_sigmas()`
-
-### 4.4 `branches.py`
-
-Owns:
-
-- `selected_branch_indices()`
-- `branch_index_groups()`
-
-### 4.5 `selectors.py`
-
-Owns:
-
-- call-index parsing
-- square spatial inference
-- logits memory estimate
-- simple shape keys
-
-### 4.6 `metadata.py`
-
-Owns:
-
-- model detection
-- transformer metadata discovery
-- safe metadata serialization
-
-### 4.7 `token_text.py`
-
-Owns:
-
-- token flattening
-- token text map construction
-- source-local indexing
-- decoder discovery
-
-Must be extended to emit `source_token_index`.
-
-### 4.8 `concepts.py`
-
-Owns all `concept_terms` parsing and matching.
-
-Required public API:
-
-```python
-@dataclass(frozen=True)
-class ConceptTermSpec:
-    raw: str
-    term: str
-    normalized: str
-    source_filter: str | None = None
-
-@dataclass(frozen=True)
-class ConceptTokenMatch:
-    term: str
-    normalized_term: str
-    token_source: str
-    token_indices: tuple[int, ...]
-    source_token_indices: tuple[int, ...]
-    token_texts: tuple[str, ...]
-    token_ids: tuple[int | None, ...]
-    ignored_token_indices: tuple[int, ...] = ()
-    occurrence_index: int = 0
-    match_warnings: tuple[str, ...] = ()
-
-@dataclass(frozen=True)
-class ConceptMatchReport:
-    matches: tuple[ConceptTokenMatch, ...]
-    unmatched_terms: tuple[ConceptTermSpec, ...]
-    ambiguous_terms: tuple[ConceptTermSpec, ...]
-    warnings: tuple[str, ...]
-```
-
-Required functions:
-
-```python
-def parse_concept_terms(spec: str) -> list[ConceptTermSpec]: ...
-def normalize_concept_text(value: str) -> str: ...
-def build_concept_token_matches(
-    concept_terms: str,
-    token_text_map: dict[int, dict[str, Any]],
-    *,
-    allow_ambiguous: bool = False,
-) -> ConceptMatchReport: ...
-```
-
-### 4.9 `scoring.py`
-
-Owns:
-
-- normalized entropy
-- top-token scores
-- concept score calculation
-
-Required function:
-
-```python
-def concept_scores_from_attention(
-    attention_probs: torch.Tensor,
-    spatial: tuple[int, int],
-    matches: Sequence[ConceptTokenMatch],
-) -> list[dict[str, Any]]: ...
-```
-
-### 4.10 `heatmaps.py`
-
-Owns:
-
-- token heatmap extraction
-- concept heatmap extraction
-- raw `.npy` and display PNG writing
-- aggregate accumulators
-- manifest writing
-
-Do not put phrase matching in this module.
-
-### 4.11 `records.py`
-
-Owns:
-
-- JSONL record construction
-- public filtering of private fields such as `_heatmap`
-- schema helpers
-
-### 4.12 `writer.py`
-
-Owns:
-
-- JSONL appending
-- optional buffered writing
-- safe directory creation
-
-### 4.13 `override.py`
-
-Owns only runtime orchestration:
-
-1. Receive attention override call.
-2. Validate shape/gates.
-3. Compute observer attention probabilities under `torch.no_grad()`.
-4. Ask scoring/heatmap/records modules to produce outputs.
-5. Return original attention backend output exactly.
-
-`override.py` is the runtime owner. It is smaller than the former monolithic implementation because matching, scoring, heatmap output, record construction, path handling, and writing live in separate modules.
+The script should work from JSONL alone. It does not need to inspect image files.
 
 ---
 
-## 5. JSONL Diagnostics for Concept Matching
+## 8. Documentation Requirements
 
-Add diagnostic events so users can debug why no concept heatmap appeared.
+Update README with:
 
-### 5.1 `concept_match_summary`
+- recommended concept-only workflow;
+- `max_tokens` explanation: it controls top-token heatmap output only and does not sharpen concept heatmaps;
+- warning that preview PNGs use per-file min-max normalization;
+- instruction to inspect `manifest.json`, `.npy`, and `heatmap_max_over_mean` before trusting preview colors;
+- run filtering examples;
+- `recommended_concept_targets.csv` interpretation;
+- branch guidance: use `positive_only` first for concept localization.
 
-Emit once during observer initialization or first observation.
+Recommended workflow text:
 
-```json
-{
-  "schema_version": 1,
-  "event": "concept_match_summary",
-  "run_id": "survey-...",
-  "prompt_text": "big breasts,",
-  "terms": ["big breasts"],
-  "matches": [
-    {
-      "term": "big breasts",
-      "token_source": "qwen3_06b",
-      "token_indices": [0, 1],
-      "token_texts": ["big", " breasts"],
-      "occurrence_index": 0
-    }
-  ],
-  "unmatched_terms": [],
-  "ambiguous_terms": [],
-  "warnings": []
-}
+```text
+For one short concept such as "big breasts":
+
+mode=observe
+capture_level=heatmap
+branch_mode=positive_only
+save_heatmaps=true
+heatmap_output=concepts_only
+prompt_text=<exact generation prompt>
+concept_terms=big breasts
+jsonl_path=<one file per run, or use --run-id later>
+heatmap_dir=<one directory per run>
 ```
-
-### 5.2 `concept_unmatched`
-
-Emit for unmatched terms.
-
-```json
-{
-  "schema_version": 1,
-  "event": "concept_unmatched",
-  "run_id": "survey-...",
-  "term": "big breasts",
-  "normalized_term": "bigbreasts",
-  "available_sources": ["qwen3_06b"],
-  "reason": "no_contiguous_token_match"
-}
-```
-
-### 5.3 `concept_alignment_warning`
-
-Emit when a match exists but confidence is reduced.
-
-Reasons:
-
-- `ambiguous_across_sources`
-- `concept_token_index_out_of_range`
-- `token_text_count_mismatch_attention_text_len`
-- `punctuation_tokens_ignored_inside_match`
-- `decoded_token_text_fallback_used`
 
 ---
 
-## 6. Testing Requirements
+## 9. Testing Requirements
 
-All tests must be automated and runnable with:
+Every behavior change must be covered by tests.
+
+Required tests:
+
+1. Duplicate match dedupe:
+   - leading punctuation/special token should not create duplicate same-span matches.
+2. Repeated phrase preservation:
+   - `big breasts, big breasts` should produce two matches only if token spans differ.
+3. Concept identity:
+   - same term in different sources or occurrences must have different `concept_uid`.
+4. Concept heatmap file names:
+   - same term but different occurrence/source does not overwrite files.
+5. Concept accumulator key:
+   - aggregate manifests keep distinct rows for distinct concept identities.
+6. Run discovery:
+   - detect two run IDs in one JSONL.
+7. Report default safety:
+   - multiple run IDs without filter raises or returns an explicit error.
+8. `--run-id`:
+   - summarizes only selected run.
+9. `--latest-run`:
+   - summarizes last run by file order.
+10. Concept JSONL stats:
+   - concept score includes `heatmap_max_over_mean`, `uniform_baseline`, and `near_uniform`.
+11. Concept target recommendations:
+   - concept-only records produce non-empty `recommended_concept_targets`.
+12. Near-uniform warnings:
+   - heatmap with max-over-mean near 1.0 is flagged.
+13. Branch delta:
+   - positive/negative concept records produce a delta row.
+14. CLI smoke tests:
+   - `summarize_survey.py --list-runs` works.
+   - `compare_survey_runs.py` writes output files.
+
+All tests must pass with:
 
 ```bash
 python -m pytest -q
 ```
 
-### 6.1 Concept parser tests
-
-Required cases:
-
-- newline-separated terms
-- semicolon-separated terms
-- comma-separated terms
-- deduped normalized terms
-- source-prefixed terms
-- empty terms ignored
-
-### 6.2 Concept matching tests
-
-Required cases:
-
-- `big` + ` breasts` matches `big breasts`
-- tokenizer marker `▁big` + `▁breasts` matches `big breasts`
-- `Ġbig` + `Ġbreasts` matches `big breasts`
-- no cross-source matching
-- explicit source prefix chooses the requested source
-- ambiguous cross-source match emits ambiguity
-- duplicate occurrences produce multiple occurrence records
-- punctuation-only token inside match is recorded as ignored
-- fallback token text such as `<token:123>` does not accidentally match human terms
-
-### 6.3 Concept heatmap math tests
-
-Use small deterministic tensors.
-
-Required tests:
-
-- concept heatmap equals sum of individual matched token heatmaps
-- concept score mean equals mean probability mass over matched tokens
-- concept score max equals max probability mass over matched tokens
-- concept entropy is computed from spatial concept heatmap
-- out-of-range token index prevents concept score for that call
-- raw `.npy` values equal the expected unnormalized heatmap
-- manifest heatmap stats equal `.npy` stats exactly within tolerance
-
-### 6.4 Integration tests
-
-Required tests:
-
-- `heatmap_output=concepts_only` writes concept files and does not write token top-k files.
-- `heatmap_output=tokens_only` writes token files and does not write concept files.
-- `heatmap_output=tokens_and_concepts` writes both.
-- positive/negative branch separation is preserved.
-- `concept_scores` appear in JSONL `attention_observation` records when matched.
-- unmatched concept terms produce diagnostic JSONL events.
-- observe mode returns original attention output exactly.
-
-### 6.5 Reporting tests
-
-Add concept-aware report tests:
-
-Expected new outputs:
-
-```text
-survey_by_concept.csv
-```
-
-Minimum fields:
-
-```text
-term,branch,eligible_call_index,observation_count,score_mean,score_max,score_entropy,token_indices,token_texts,token_sources
-```
-
-`recommended_lora_targets.csv` may continue to work from token scores, but should not break when token scores are absent and only concept scores exist.
-
 ---
 
-## 7. Manual Validation Protocol
+## 10. Manual Validation Requirements
 
-Use this fixed ComfyUI protocol after automated tests pass.
+After implementation, validate in ComfyUI with a clean run.
 
-### 7.1 Baseline invariance
+### 10.1 Concept-only positive run
 
-1. Restart ComfyUI.
-2. Run fixed seed/prompt/sampler without the survey node.
-3. Save output image.
-4. Run the same fixed seed/prompt/sampler with survey node:
+Settings:
 
 ```text
 mode=observe
 capture_level=heatmap
+branch_mode=positive_only
 save_heatmaps=true
 heatmap_output=concepts_only
-prompt_text=<exact generation prompt>
+prompt_text=<exact actual generation prompt>
 concept_terms=big breasts
+jsonl_path=anima_concept_survey/logs/big_breasts_positive.jsonl
+heatmap_dir=anima_concept_survey/heatmaps_big_breasts_positive
 ```
 
-5. Confirm generated image is unchanged.
+Expected:
 
-### 7.2 Concept output check
+- no duplicate same-span concept matches;
+- `concept_match_summary` has one match for one phrase occurrence;
+- aggregate concept manifest has correct observation count;
+- `recommended_concept_targets.csv` contains calls comparable to Trial 1 candidates;
+- report warns only if focus is weak or near-uniform.
 
-Confirm:
+### 10.2 Multi-run JSONL validation
+
+Append two runs to one JSONL.
+
+Expected:
+
+- `--list-runs` shows both runs;
+- no-filter summary fails or warns clearly;
+- `--run-id` isolates one run;
+- `--latest-run` isolates the last run.
+
+### 10.3 Both-branch validation
+
+Settings:
 
 ```text
-heatmaps/concepts/aggregate/aggregate_positive_concept_big_breasts_preview.png
-heatmaps/concepts/aggregate/manifest.json
+branch_mode=both
+heatmap_output=concepts_only
 ```
 
-exist.
+Expected:
 
-Confirm JSONL contains:
-
-- `concept_match_summary`
-- `attention_observation` records with `concept_scores`
-- no unexpected `concept_unmatched` for `big breasts`
-
-### 7.3 Alignment check
-
-Inspect JSONL and confirm:
-
-```text
-text_len >= max(token_indices) + 1
-token_texts correspond to the intended phrase
-token_sources are not mixed
-```
-
-### 7.4 Report check
-
-Run:
-
-```bash
-python scripts/summarize_survey.py <survey.jsonl> --out-dir <report_dir> --top-k 32
-```
-
-Confirm:
-
-- report generation succeeds
-- `survey_by_concept.csv` exists
-- concept rows include `big breasts`
+- positive and negative concept sections are separate;
+- near-uniform negative maps are flagged;
+- branch delta CSV is generated.
 
 ---
 
-## 8. Refactor Strategy
+## 11. Out of Scope for This Follow-up
 
-Use small, reversible patches.
+Do not implement these in this pass unless explicitly requested:
 
-Recommended sequence:
-
-1. Add characterization tests against current behavior.
-2. Extract pure helpers from `survey_attention.py` without changing behavior.
-3. Add new concept data classes and tests.
-4. Replace old concept group logic with new match report logic.
-5. Add diagnostics for unmatched/ambiguous concepts.
-6. Move heatmap writing and aggregation behind a small API.
-7. Simplify `AnimaConceptSurveyAttentionOverride`.
-8. Extend reporting to concept scores.
-9. Run automated tests after every patch.
-
-Avoid large rewrites that change architecture and behavior simultaneously.
+- separate ConceptAttention concept-vector stream;
+- final image segmentation or overlay node;
+- LoRA training;
+- model merge automation;
+- rectangular latent layouts;
+- video/Cosmos layouts;
+- composing with other `optimized_attention_override` patches.
 
 ---
 
-## 9. Acceptance Criteria
+## 12. Completion Criteria
 
-The refactor is complete when all of the following are true:
+Automated completion status:
 
-- `python -m pytest -q` passes.
-- Existing public node inputs remain available.
-- Existing token heatmap behavior still works.
-- `concept_terms=big breasts` maps to the intended prompt tokens in unit tests and manual ComfyUI validation.
-- Concept heatmap raw values equal summed attention probability over matched token indices.
-- Concept aggregate manifest stats match saved `.npy` values.
-- Unmatched and ambiguous concept terms are visible in JSONL diagnostics.
-- Observe mode output remains bitwise identical to the original backend return in tests.
-- `survey_by_concept.csv` is generated from JSONL concept scores.
-- README, SPEC, PROGRESS, and TASKS describe the final behavior.
+- [x] duplicate same-span concept matches are eliminated;
+- [x] true repeated phrase occurrences remain supported;
+- [x] concept heatmap file/aggregate/report identities cannot collide;
+- [x] `summarize_survey.py` supports run filtering and protects against accidental run mixing;
+- [x] `recommended_concept_targets.csv` exists and works for concept-only records;
+- [x] near-uniform preview warnings appear in reports;
+- [x] branch delta output exists;
+- [x] README explains concept-only workflow, preview normalization, and run filtering;
+- [x] all automated tests pass;
+- [ ] at least one fresh ComfyUI concept-only run validates the fixes.

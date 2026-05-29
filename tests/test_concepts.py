@@ -75,6 +75,48 @@ class ConceptTests(unittest.TestCase):
         self.assertEqual([match.token_indices for match in report.matches], [(1,), (3,)])
         self.assertEqual([match.occurrence_index for match in report.matches], [0, 1])
 
+    def test_empty_normalized_token_before_phrase_does_not_duplicate_same_span(self):
+        report = build_concept_token_matches("big breasts", {
+            0: {"token_index": 0, "source_token_index": 0, "token_text": "<s>", "token_source": "qwen3_06b"},
+            1: {"token_index": 1, "source_token_index": 1, "token_text": " big", "token_source": "qwen3_06b"},
+            2: {"token_index": 2, "source_token_index": 2, "token_text": " breasts", "token_source": "qwen3_06b"},
+        })
+
+        self.assertEqual(len(report.matches), 1)
+        self.assertEqual(report.matches[0].token_indices, (1, 2))
+        self.assertEqual(report.matches[0].source_token_indices, (1, 2))
+        self.assertEqual(report.matches[0].occurrence_index, 0)
+
+    def test_repeated_phrase_preserves_distinct_token_spans(self):
+        report = build_concept_token_matches("big breasts", {
+            0: {"token_index": 0, "source_token_index": 0, "token_text": " big", "token_source": "qwen"},
+            1: {"token_index": 1, "source_token_index": 1, "token_text": " breasts", "token_source": "qwen"},
+            2: {"token_index": 2, "source_token_index": 2, "token_text": ",", "token_source": "qwen"},
+            3: {"token_index": 3, "source_token_index": 3, "token_text": " big", "token_source": "qwen"},
+            4: {"token_index": 4, "source_token_index": 4, "token_text": " breasts", "token_source": "qwen"},
+        })
+
+        self.assertEqual([match.token_indices for match in report.matches], [(0, 1), (3, 4)])
+        self.assertEqual([match.occurrence_index for match in report.matches], [0, 1])
+
+    def test_concept_uid_distinguishes_occurrences_and_sources(self):
+        repeated = build_concept_token_matches("big breasts", {
+            0: {"token_index": 0, "source_token_index": 0, "token_text": "big", "token_source": "qwen"},
+            1: {"token_index": 1, "source_token_index": 1, "token_text": " breasts", "token_source": "qwen"},
+            2: {"token_index": 2, "source_token_index": 2, "token_text": "big", "token_source": "qwen"},
+            3: {"token_index": 3, "source_token_index": 3, "token_text": " breasts", "token_source": "qwen"},
+        })
+        sourced = build_concept_token_matches("qwen:big breasts; clip_l:big breasts", {
+            0: {"token_index": 0, "source_token_index": 0, "token_text": "big", "token_source": "qwen"},
+            1: {"token_index": 1, "source_token_index": 1, "token_text": " breasts", "token_source": "qwen"},
+            2: {"token_index": 2, "source_token_index": 0, "token_text": "big", "token_source": "clip_l"},
+            3: {"token_index": 3, "source_token_index": 1, "token_text": " breasts", "token_source": "clip_l"},
+        })
+
+        self.assertEqual(len({match.concept_uid for match in repeated.matches}), 2)
+        self.assertEqual(len({match.concept_uid for match in sourced.matches}), 2)
+        self.assertTrue(all(match.concept_uid for match in repeated.matches + sourced.matches))
+
     def test_punctuation_inside_match_is_recorded_as_ignored(self):
         report = build_concept_token_matches("big breasts", {
             0: {"token_index": 0, "source_token_index": 0, "token_text": "big", "token_source": "qwen"},
