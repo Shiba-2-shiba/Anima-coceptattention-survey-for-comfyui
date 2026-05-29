@@ -246,8 +246,11 @@ class SurveyAttentionTests(unittest.TestCase):
             self.assertIn("heatmap_max", manifest[0])
             self.assertIn("heatmap_std", manifest[0])
             self.assertIn("heatmap_max_over_mean", manifest[0])
+            self.assertEqual(manifest[0]["preview_normalization"], "per_file_minmax")
             self.assertGreaterEqual(len(list((heatmap_dir / "aggregate").glob("*_preview.png"))), 2)
             self.assertTrue((heatmap_dir / "aggregate" / "manifest.json").exists())
+            aggregate_manifest = json.loads((heatmap_dir / "aggregate" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(aggregate_manifest[0]["preview_normalization"], "per_file_minmax")
 
     def test_concept_terms_export_combined_phrase_heatmaps(self):
         torch.manual_seed(41)
@@ -296,14 +299,70 @@ class SurveyAttentionTests(unittest.TestCase):
             self.assertTrue((heatmap_dir / "concepts" / "aggregate" / "manifest.json").exists())
             self.assertEqual(list(heatmap_dir.glob("step*_token*.npy")), [])
             self.assertEqual(list(heatmap_dir.glob("step*_token*.png")), [])
-            self.assertGreaterEqual(len(list((heatmap_dir / "concepts" / "aggregate").glob("*big_breasts_preview.png"))), 1)
             manifest = json.loads((heatmap_dir / "concepts" / "aggregate" / "manifest.json").read_text(encoding="utf-8"))
             row = manifest[0]
+            self.assertEqual(row["concept_uid"], observation["concept_scores"][0]["concept_uid"])
+            self.assertEqual(row["preview_normalization"], "per_file_minmax")
+            self.assertTrue((heatmap_dir / "concepts" / "aggregate" / row["preview_png"]).exists())
             arr = np.load(heatmap_dir / "concepts" / "aggregate" / row["npy"])
             self.assertTrue(math.isclose(row["heatmap_mean"], float(arr.mean()), rel_tol=1e-6))
             self.assertTrue(math.isclose(row["heatmap_max"], float(arr.max()), rel_tol=1e-6))
             self.assertTrue(math.isclose(row["heatmap_std"], float(arr.std()), rel_tol=1e-6))
             self.assertTrue(math.isclose(row["heatmap_max_over_mean"], float(arr.max() / arr.mean()), rel_tol=1e-6))
+
+    def test_repeated_concept_heatmaps_use_distinct_identity_and_files(self):
+        torch.manual_seed(44)
+        q = torch.randn(1, 2, 16, 4)
+        k = torch.randn(1, 2, 5, 4)
+        v = torch.randn(1, 2, 5, 4)
+        with tempfile.TemporaryDirectory() as tmp:
+            jsonl_path = Path(tmp) / "survey.jsonl"
+            heatmap_dir = Path(tmp) / "heatmaps"
+            override = AnimaConceptSurveyAttentionOverride(SurveyConfig(
+                jsonl_path=str(jsonl_path),
+                capture_level="heatmap",
+                save_heatmaps=True,
+                heatmap_dir=str(heatmap_dir),
+                max_tokens=1,
+                concept_terms="big breasts",
+                token_text_map={
+                    0: {"token_index": 0, "source_token_index": 0, "token_text": "big", "token_source": "qwen"},
+                    1: {"token_index": 1, "source_token_index": 1, "token_text": " breasts", "token_source": "qwen"},
+                    2: {"token_index": 2, "source_token_index": 2, "token_text": ",", "token_source": "qwen"},
+                    3: {"token_index": 3, "source_token_index": 3, "token_text": "big", "token_source": "qwen"},
+                    4: {"token_index": 4, "source_token_index": 4, "token_text": " breasts", "token_source": "qwen"},
+                },
+            ))
+            override(
+                reference_attention,
+                q,
+                k,
+                v,
+                2,
+                skip_reshape=True,
+                transformer_options={
+                    "sigmas": torch.tensor([0.5]),
+                    "sample_sigmas": torch.tensor([1.0, 0.5, 0.0]),
+                },
+            )
+            override.finalize()
+
+            records = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+            match_summary = next(record for record in records if record.get("event") == "concept_match_summary")
+            observation = next(record for record in records if record.get("event") == "attention_observation")
+            concept_uids = [score["concept_uid"] for score in observation["concept_scores"]]
+
+            self.assertEqual(len(match_summary["matches"]), 2)
+            self.assertEqual(len(concept_uids), 2)
+            self.assertEqual(len(set(concept_uids)), 2)
+            self.assertTrue(all(match["concept_uid"] for match in match_summary["matches"]))
+
+            manifest = json.loads((heatmap_dir / "concepts" / "manifest.json").read_text(encoding="utf-8"))
+            aggregate_manifest = json.loads((heatmap_dir / "concepts" / "aggregate" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(manifest), 2)
+            self.assertEqual(len(aggregate_manifest), 2)
+            self.assertEqual(len({row["npy"] for row in manifest}), 2)
+            self.assertEqual({row["concept_uid"] for row in aggregate_manifest}, set(concept_uids))
 
     def test_unmatched_concept_terms_emit_jsonl_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -434,6 +493,22 @@ class SurveyAttentionTests(unittest.TestCase):
             self.assertTrue(torch.allclose(scores[0]["_heatmap"], expected_heatmap))
             self.assertTrue(math.isclose(scores[0]["score_mean"], float(expected_mass.mean()), rel_tol=1e-6))
             self.assertTrue(math.isclose(scores[0]["score_max"], float(expected_mass.max()), rel_tol=1e-6))
+            self.assertTrue(math.isclose(scores[0]["heatmap_mean"], float(expected_heatmap.mean()), rel_tol=1e-6))
+            self.assertTrue(math.isclose(scores[0]["heatmap_max"], float(expected_heatmap.max()), rel_tol=1e-6))
+            self.assertTrue(math.isclose(scores[0]["heatmap_std"], float(expected_heatmap.numpy().std()), rel_tol=1e-6))
+            self.assertTrue(math.isclose(
+                scores[0]["heatmap_max_over_mean"],
+                float(expected_heatmap.max() / expected_heatmap.mean()),
+                rel_tol=1e-6,
+            ))
+            self.assertEqual(scores[0]["attention_key_indices"], [0, 2])
+            self.assertEqual(scores[0]["uniform_baseline"], 2 / 3)
+            self.assertTrue(math.isclose(
+                scores[0]["score_mean_over_uniform"],
+                float(expected_mass.mean()) / (2 / 3),
+                rel_tol=1e-6,
+            ))
+            self.assertFalse(scores[0]["near_uniform"])
 
             progress = progress_from_sigmas({
                 "sigmas": torch.tensor([0.5]),
@@ -447,6 +522,7 @@ class SurveyAttentionTests(unittest.TestCase):
             self.assertTrue(np.allclose(saved, expected_heatmap.numpy()))
             self.assertTrue(math.isclose(manifest[0]["heatmap_mean"], float(saved.mean()), rel_tol=1e-6))
             self.assertTrue(math.isclose(manifest[0]["heatmap_max"], float(saved.max()), rel_tol=1e-6))
+            self.assertEqual(manifest[0]["preview_normalization"], "per_file_minmax")
 
 
 if __name__ == "__main__":
